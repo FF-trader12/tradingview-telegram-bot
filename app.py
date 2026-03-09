@@ -20,28 +20,39 @@ TOPIC_MAP = {
     "AUDNZD": 29
 }
 
+
+@app.route("/", methods=["GET"])
+def home():
+    return "TradingView Telegram Bot is running", 200
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    try:
+        data = request.get_json(force=True)
 
-    data = request.json
+        pair = str(data.get("pair", "")).upper().strip()
+        direction = str(data.get("direction", "")).upper().strip()
+        entry = str(data.get("entry", "")).strip()
+        stop_price = str(data.get("stop_price", "")).strip()
+        stop_pips = str(data.get("stop_pips", "")).strip()
+        target_price = str(data.get("target_price", "")).strip()
+        target_pips = str(data.get("target_pips", "")).strip()
+        risk = str(data.get("risk", "")).strip()
+        lot = str(data.get("lot_size", "")).strip()
+        rr = str(data.get("rr", "")).strip()
+        tf = str(data.get("timeframe", "")).strip()
 
-    pair = data["pair"]
-    direction = data["direction"]
-    entry = data["entry"]
-    stop_price = data["stop_price"]
-    stop_pips = data["stop_pips"]
-    target_price = data["target_price"]
-    target_pips = data["target_pips"]
-    risk = data["risk"]
-    lot = data["lot_size"]
-    rr = data["rr"]
-    tf = data["timeframe"]
+        if not pair:
+            return jsonify({"ok": False, "error": "Missing pair"}), 400
 
-    topic = TOPIC_MAP.get(pair)
+        topic = TOPIC_MAP.get(pair)
+        if topic is None:
+            return jsonify({"ok": False, "error": f"Pair not mapped: {pair}"}), 400
 
-    emoji = "📈" if direction == "BUY" else "📉"
+        emoji = "📈" if direction == "BUY" else "📉"
 
-    message = f"""{emoji} {pair} {direction}
+        message = f"""{emoji} {pair} {direction}
 
 Entry: {entry}
 SL: {stop_price} ({stop_pips} pips)
@@ -53,13 +64,25 @@ RR: {rr}:1
 TF: {tf}
 """
 
-    requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json={
-            "chat_id": CHAT_ID,
-            "message_thread_id": topic,
-            "text": message
-        }
-    )
+        telegram_response = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": CHAT_ID,
+                "message_thread_id": topic,
+                "text": message
+            },
+            timeout=2
+        )
 
-    return jsonify({"status":"ok"})
+        if telegram_response.status_code != 200:
+            return jsonify({
+                "ok": False,
+                "error": "Telegram send failed",
+                "telegram_status": telegram_response.status_code,
+                "telegram_response": telegram_response.text
+            }), 502
+
+        return jsonify({"ok": True, "status": "sent"}), 200
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
