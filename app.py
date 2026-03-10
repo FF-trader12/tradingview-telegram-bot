@@ -138,11 +138,11 @@ def home():
     return "TradingView Telegram Bot is running", 200
 
 
-def api_url(method: str) -> str:
+def api_url(method):
     return f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
 
 
-def format_tf(tf: str) -> str:
+def format_tf(tf):
     tf = str(tf).strip()
     if tf.isdigit():
         return f"{tf}m"
@@ -152,7 +152,7 @@ def format_tf(tf: str) -> str:
     return tf
 
 
-def parse_tv_time(raw_time: str):
+def parse_tv_time(raw_time):
     raw_time = str(raw_time).strip()
     if not raw_time:
         return datetime.now(timezone.utc)
@@ -188,11 +188,11 @@ def parse_calendar_time(raw):
         return None
 
 
-def format_timestamp(dt: datetime) -> str:
+def format_timestamp(dt):
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def get_session(dt: datetime) -> str:
+def get_session(dt):
     hour = dt.astimezone(timezone.utc).hour
     if 0 <= hour < 7:
         return "Asia"
@@ -210,12 +210,12 @@ def to_float(value):
         return None
 
 
-def normalize_event_type(event_type: str) -> str:
+def normalize_event_type(event_type):
     event_type = str(event_type or "SETUP").upper().strip()
     return EVENT_ALIASES.get(event_type, event_type)
 
 
-def send_telegram_message(text: str, thread_id: int = None):
+def send_telegram_message(text, thread_id=None):
     payload = {
         "chat_id": CHAT_ID,
         "text": text,
@@ -226,7 +226,7 @@ def send_telegram_message(text: str, thread_id: int = None):
     return requests.post(api_url("sendMessage"), json=payload, timeout=5)
 
 
-def delete_telegram_message(message_id: int):
+def delete_telegram_message(message_id):
     return requests.post(
         api_url("deleteMessage"),
         json={
@@ -237,7 +237,7 @@ def delete_telegram_message(message_id: int):
     )
 
 
-def is_admin(user_id: int) -> bool:
+def is_admin(user_id):
     try:
         resp = requests.post(
             api_url("getChatMember"),
@@ -297,7 +297,7 @@ def log_event(
     conn.close()
 
 
-def news_already_sent(event_key: str) -> bool:
+def news_already_sent(event_key):
     conn = get_db()
     cur = conn.cursor()
     cur.execute("SELECT 1 FROM sent_news_events WHERE event_key = ?", (event_key,))
@@ -306,7 +306,7 @@ def news_already_sent(event_key: str) -> bool:
     return row is not None
 
 
-def mark_news_sent(event_key: str):
+def mark_news_sent(event_key):
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
@@ -451,7 +451,7 @@ def webhook():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-def fetch_rows_since(start_dt: datetime | None):
+def fetch_rows_since(start_dt=None):
     conn = get_db()
     cur = conn.cursor()
 
@@ -509,7 +509,7 @@ def summarize_rows(rows):
     }
 
 
-def build_report(title: str, days: int | None):
+def build_report(title, days=None):
     now = datetime.now(timezone.utc)
     start = None if days is None else now - timedelta(days=days)
 
@@ -690,7 +690,7 @@ def check_news():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-def calculate_lot_size(pair: str, risk: float, stop_pips: float):
+def calculate_lot_size(pair, risk, stop_pips):
     pip_value = PIP_VALUE_MAP.get(pair)
     if pip_value is None:
         return None, None
@@ -702,7 +702,7 @@ def calculate_lot_size(pair: str, risk: float, stop_pips: float):
     return pip_value, lot_size
 
 
-def process_lotsize_command(text: str):
+def process_lotsize_command(text):
     parts = text.strip().split()
 
     if len(parts) != 4:
@@ -741,7 +741,7 @@ def process_lotsize_command(text: str):
     )
 
 
-def get_latest_signal(pair: str):
+def get_latest_signal(pair):
     conn = get_db()
     cur = conn.cursor()
 
@@ -796,7 +796,7 @@ def get_latest_signal(pair: str):
     }
 
 
-def build_signal_lookup_message(pair: str):
+def build_signal_lookup_message(pair):
     result = get_latest_signal(pair)
     if not result:
         return f"No saved signal found for {pair}."
@@ -914,7 +914,6 @@ def telegram_webhook():
 
         admin = is_admin(user_id) if user_id else False
 
-        # Commands
         if text.startswith("/"):
             if text.startswith("/help"):
                 help_text = (
@@ -974,7 +973,6 @@ def telegram_webhook():
 
             return jsonify({"ok": True, "handled": "command"}), 200
 
-        # Non-command moderation
         if (not admin) and (thread_id in PROTECTED_TOPICS):
             if message_id:
                 delete_telegram_message(message_id)
