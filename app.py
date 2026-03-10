@@ -31,13 +31,18 @@ TOPIC_MAP = {
     "USDCHF": 76,
     "USDCAD": 78,
     "GBPUSD": 80,
-    "DE40": 82
+    "DE40": 82,
+}
+
+PROTECTED_TOPICS = set(TOPIC_MAP.values()) | {
+    HIGH_IMPACT_NEWS_TOPIC,
+    WEEKLY_RESULTS_TOPIC,
 }
 
 PAIR_EMOJI = {
     "XAUUSD": "🥇",
     "XAGUSD": "🥈",
-    "DE40": "📊"
+    "DE40": "📊",
 }
 
 PIP_VALUE_MAP = {
@@ -58,7 +63,7 @@ PIP_VALUE_MAP = {
     "XAGUSD": 0.3721,
     "USDCAD": 0.5484,
     "GBPUSD": 0.7439,
-    "EURCHF": 0.9567
+    "EURCHF": 0.9567,
 }
 
 CURRENCY_TO_PAIRS = {
@@ -69,7 +74,16 @@ CURRENCY_TO_PAIRS = {
     "GBP": ["GBPJPY", "EURGBP", "GBPUSD"],
     "JPY": ["GBPJPY", "AUDJPY", "CADJPY", "EURJPY"],
     "CAD": ["AUDCAD", "CADJPY", "USDCAD"],
-    "CHF": ["EURCHF", "USDCHF"]
+    "CHF": ["EURCHF", "USDCHF"],
+}
+
+EVENT_ALIASES = {
+    "TP1_HIT": "TP_HIT",
+    "TP_HIT": "TP_HIT",
+    "SL_HIT": "SL_HIT",
+    "BE_HIT": "BE_HIT",
+    "MOVE_TO_BE": "MOVE_TO_BE",
+    "SETUP": "SETUP",
 }
 
 DB_PATH = "signals.db"
@@ -124,6 +138,10 @@ def home():
     return "TradingView Telegram Bot is running", 200
 
 
+def api_url(method: str) -> str:
+    return f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+
+
 def format_tf(tf: str) -> str:
     tf = str(tf).strip()
     if tf.isdigit():
@@ -149,9 +167,25 @@ def parse_tv_time(raw_time: str):
             pass
 
     try:
-        return datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
     except Exception:
         return datetime.now(timezone.utc)
+
+
+def parse_calendar_time(raw):
+    raw = str(raw).strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
 
 
 def format_timestamp(dt: datetime) -> str:
@@ -176,19 +210,49 @@ def to_float(value):
         return None
 
 
+def normalize_event_type(event_type: str) -> str:
+    event_type = str(event_type or "SETUP").upper().strip()
+    return EVENT_ALIASES.get(event_type, event_type)
+
+
 def send_telegram_message(text: str, thread_id: int = None):
     payload = {
         "chat_id": CHAT_ID,
-        "text": text
+        "text": text,
     }
     if thread_id is not None:
         payload["message_thread_id"] = thread_id
 
+    return requests.post(api_url("sendMessage"), json=payload, timeout=5)
+
+
+def delete_telegram_message(message_id: int):
     return requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json=payload,
-        timeout=5
+        api_url("deleteMessage"),
+        json={
+            "chat_id": CHAT_ID,
+            "message_id": message_id,
+        },
+        timeout=5,
     )
+
+
+def is_admin(user_id: int) -> bool:
+    try:
+        resp = requests.post(
+            api_url("getChatMember"),
+            json={"chat_id": CHAT_ID, "user_id": user_id},
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return False
+        data = resp.json()
+        if not data.get("ok"):
+            return False
+        status = data["result"].get("status", "")
+        return status in {"creator", "administrator"}
+    except Exception:
+        return False
 
 
 def log_event(
@@ -204,7 +268,7 @@ def log_event(
     target_pips,
     risk,
     lot_size,
-    rr
+    rr,
 ):
     conn = get_db()
     cur = conn.cursor()
@@ -227,7 +291,7 @@ def log_event(
         target_pips,
         risk,
         lot_size,
-        rr
+        rr,
     ))
     conn.commit()
     conn.close()
@@ -247,7 +311,7 @@ def mark_news_sent(event_key: str):
     cur = conn.cursor()
     cur.execute(
         "INSERT OR IGNORE INTO sent_news_events (event_key, sent_at_utc) VALUES (?, ?)",
-        (event_key, datetime.now(timezone.utc).isoformat())
+        (event_key, datetime.now(timezone.utc).isoformat()),
     )
     conn.commit()
     conn.close()
@@ -266,7 +330,7 @@ def build_signal_message(data):
     rr = str(data.get("rr", "")).strip()
     tf = format_tf(data.get("timeframe", ""))
     raw_time = str(data.get("time", "")).strip()
-    event_type = str(data.get("event_type", "SETUP")).upper().strip()
+    event_type = normalize_event_type(data.get("event_type", "SETUP"))
 
     dt = parse_tv_time(raw_time)
     session = get_session(dt)
@@ -276,7 +340,7 @@ def build_signal_message(data):
     pair_emoji = PAIR_EMOJI.get(pair, "💱")
 
     if event_type == "SETUP":
-        text = (
+        return (
             f"{emoji} {pair_emoji} {pair} {direction} SETUP\n\n"
             f"Entry: {entry}\n"
             f"SL: {stop_price} ({stop_pips} pips)\n"
@@ -288,8 +352,9 @@ def build_signal_message(data):
             f"Session: {session}\n"
             f"Time: {time_text}"
         )
-    elif event_type == "TP_HIT":
-        text = (
+
+    if event_type == "TP_HIT":
+        return (
             f"✅ {pair_emoji} {pair} TP HIT\n\n"
             f"Direction: {direction}\n"
             f"Entry: {entry}\n"
@@ -297,8 +362,9 @@ def build_signal_message(data):
             f"TF: {tf}\n"
             f"Time: {time_text}"
         )
-    elif event_type == "SL_HIT":
-        text = (
+
+    if event_type == "SL_HIT":
+        return (
             f"❌ {pair_emoji} {pair} SL HIT\n\n"
             f"Direction: {direction}\n"
             f"Entry: {entry}\n"
@@ -306,8 +372,9 @@ def build_signal_message(data):
             f"TF: {tf}\n"
             f"Time: {time_text}"
         )
-    elif event_type == "BE_HIT":
-        text = (
+
+    if event_type == "BE_HIT":
+        return (
             f"🔒 {pair_emoji} {pair} BE HIT\n\n"
             f"Direction: {direction}\n"
             f"Entry: {entry}\n"
@@ -315,8 +382,9 @@ def build_signal_message(data):
             f"TF: {tf}\n"
             f"Time: {time_text}"
         )
-    elif event_type == "MOVE_TO_BE":
-        text = (
+
+    if event_type == "MOVE_TO_BE":
+        return (
             f"🟠 {pair_emoji} {pair} MOVE TO BE\n\n"
             f"Direction: {direction}\n"
             f"Entry: {entry}\n"
@@ -324,15 +392,13 @@ def build_signal_message(data):
             f"TF: {tf}\n"
             f"Time: {time_text}"
         )
-    else:
-        text = (
-            f"ℹ️ {pair_emoji} {pair} {event_type}\n\n"
-            f"Direction: {direction}\n"
-            f"TF: {tf}\n"
-            f"Time: {time_text}"
-        )
 
-    return text
+    return (
+        f"ℹ️ {pair_emoji} {pair} {event_type}\n\n"
+        f"Direction: {direction}\n"
+        f"TF: {tf}\n"
+        f"Time: {time_text}"
+    )
 
 
 @app.route("/webhook", methods=["POST"])
@@ -342,7 +408,7 @@ def webhook():
 
         pair = str(data.get("pair", "")).upper().strip()
         direction = str(data.get("direction", "")).upper().strip()
-        event_type = str(data.get("event_type", "SETUP")).upper().strip()
+        event_type = normalize_event_type(data.get("event_type", "SETUP"))
         timeframe = format_tf(data.get("timeframe", ""))
         raw_time = str(data.get("time", "")).strip()
         dt = parse_tv_time(raw_time)
@@ -366,7 +432,7 @@ def webhook():
             target_pips=to_float(data.get("target_pips")),
             risk=str(data.get("risk", "")).strip(),
             lot_size=str(data.get("lot_size", "")).strip(),
-            rr=str(data.get("rr", "")).strip()
+            rr=str(data.get("rr", "")).strip(),
         )
 
         tg_resp = send_telegram_message(message, thread_id=topic)
@@ -376,7 +442,7 @@ def webhook():
                 "ok": False,
                 "error": "Telegram send failed",
                 "telegram_status": tg_resp.status_code,
-                "telegram_response": tg_resp.text
+                "telegram_response": tg_resp.text,
             }), 502
 
         return jsonify({"ok": True, "status": "sent"}), 200
@@ -385,30 +451,34 @@ def webhook():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-def compute_stats(days=7):
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(days=days)
-
+def fetch_rows_since(start_dt: datetime | None):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("""
-        SELECT * FROM trade_events
-        WHERE event_time_utc >= ?
-        ORDER BY event_time_utc ASC
-    """, (start.isoformat(),))
+
+    if start_dt is None:
+        cur.execute("SELECT * FROM trade_events ORDER BY event_time_utc ASC")
+    else:
+        cur.execute("""
+            SELECT * FROM trade_events
+            WHERE event_time_utc >= ?
+            ORDER BY event_time_utc ASC
+        """, (start_dt.isoformat(),))
+
     rows = cur.fetchall()
     conn.close()
+    return rows
 
+
+def summarize_rows(rows):
     total_setups = 0
     tp_hits = 0
     sl_hits = 0
     be_hits = 0
-
     pips_won = 0.0
     pips_lost = 0.0
 
     for row in rows:
-        event_type = row["event_type"]
+        event_type = normalize_event_type(row["event_type"])
         target_pips = row["target_pips"] or 0.0
         stop_pips = row["stop_pips"] or 0.0
 
@@ -436,15 +506,21 @@ def compute_stats(days=7):
         "pips_won": round(pips_won, 2),
         "pips_lost": round(pips_lost, 2),
         "net_pips": round(net_pips, 2),
-        "period_from": start,
-        "period_to": now
     }
 
 
-def build_report(title: str, days=7):
-    stats = compute_stats(days=days)
-    period_from = stats["period_from"].strftime("%d %b")
-    period_to = stats["period_to"].strftime("%d %b")
+def build_report(title: str, days: int | None):
+    now = datetime.now(timezone.utc)
+    start = None if days is None else now - timedelta(days=days)
+
+    rows = fetch_rows_since(start)
+    stats = summarize_rows(rows)
+
+    if start is None:
+        period_from = "Start"
+    else:
+        period_from = start.strftime("%d %b")
+    period_to = now.strftime("%d %b")
 
     report = (
         f"{title}\n\n"
@@ -459,7 +535,17 @@ def build_report(title: str, days=7):
         f"Pips Lost: -{stats['pips_lost']:.2f}\n\n"
         f"Net Pips: {stats['net_pips']:+.2f}"
     )
+
     return stats, report
+
+
+@app.route("/daily-report", methods=["GET"])
+def daily_report():
+    try:
+        stats, report = build_report("📊 DAILY RESULTS", days=1)
+        return jsonify({"ok": True, **stats, "report": report}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/weekly-report", methods=["GET"])
@@ -482,19 +568,10 @@ def weekly_report_send():
                 "ok": False,
                 "error": "Telegram send failed",
                 "telegram_status": tg_resp.status_code,
-                "telegram_response": tg_resp.text
+                "telegram_response": tg_resp.text,
             }), 502
 
         return jsonify({"ok": True, "report_sent": True, **stats}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.route("/daily-report", methods=["GET"])
-def daily_report():
-    try:
-        stats, report = build_report("📊 DAILY RESULTS", days=1)
-        return jsonify({"ok": True, **stats, "report": report}), 200
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -504,16 +581,6 @@ def fetch_calendar():
     resp = requests.get(url, timeout=10)
     resp.raise_for_status()
     return resp.json()
-
-
-def parse_calendar_time(raw):
-    raw = str(raw).strip()
-    if not raw:
-        return None
-    try:
-        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except Exception:
-        return None
 
 
 def extract_currency_country(event):
@@ -531,59 +598,76 @@ def extract_currency_country(event):
         "New Zealand": "NZD",
         "Canada": "CAD",
         "Switzerland": "CHF",
-        "Japan": "JPY"
+        "Japan": "JPY",
     }
     return country_map.get(country, "")
 
 
 def affected_pairs_for_currency(currency):
-    return CURRENCY_TO_PAIRS.get(currency, [])
+    return [p for p in CURRENCY_TO_PAIRS.get(currency, []) if p in TOPIC_MAP]
+
+
+def get_high_impact_events():
+    now = datetime.now(timezone.utc)
+    events = fetch_calendar()
+    results = []
+
+    for event in events:
+        importance = int(event.get("Importance", 0) or 0)
+        if importance < 3:
+            continue
+
+        event_dt = parse_calendar_time(event.get("Date"))
+        if event_dt is None:
+            continue
+        if event_dt < now:
+            continue
+
+        currency = extract_currency_country(event)
+        if not currency:
+            continue
+
+        affected_pairs = affected_pairs_for_currency(currency)
+        if not affected_pairs:
+            continue
+
+        event_name = str(event.get("Event", "Economic Event")).strip()
+        minutes_until = int((event_dt - now).total_seconds() // 60)
+
+        results.append({
+            "currency": currency,
+            "event": event_name,
+            "time": event_dt,
+            "minutes_until": minutes_until,
+            "affected_pairs": affected_pairs,
+        })
+
+    results.sort(key=lambda x: x["time"])
+    return results
 
 
 @app.route("/check-news", methods=["GET", "POST"])
 def check_news():
     try:
-        now = datetime.now(timezone.utc)
-        events = fetch_calendar()
-
+        news_items = get_high_impact_events()
         sent = []
 
-        for event in events:
-            importance = int(event.get("Importance", 0) or 0)
-            if importance < 3:
-                continue
-
-            event_dt = parse_calendar_time(event.get("Date"))
-            if event_dt is None:
-                continue
-
-            delta = event_dt - now
-            minutes_until = int(delta.total_seconds() // 60)
-
+        for item in news_items:
+            minutes_until = item["minutes_until"]
             if not (0 <= minutes_until <= 30):
                 continue
 
-            currency = extract_currency_country(event)
-            if not currency:
-                continue
-
-            affected_pairs = affected_pairs_for_currency(currency)
-            if not affected_pairs:
-                continue
-
-            event_name = str(event.get("Event", "Economic Event")).strip()
-            event_key = f"{currency}|{event_name}|{event_dt.isoformat()}"
-
+            event_key = f"{item['currency']}|{item['event']}|{item['time'].isoformat()}"
             if news_already_sent(event_key):
                 continue
 
-            pair_lines = "\n".join([f"• {p}" for p in affected_pairs])
+            pair_lines = "\n".join([f"• {p}" for p in item["affected_pairs"]])
 
             message = (
                 f"⚠️ HIGH IMPACT NEWS SOON\n\n"
-                f"Currency: {currency}\n"
-                f"Event: {event_name}\n"
-                f"Time: {format_timestamp(event_dt)}\n"
+                f"Currency: {item['currency']}\n"
+                f"Event: {item['event']}\n"
+                f"Time: {format_timestamp(item['time'])}\n"
                 f"Starts In: {minutes_until} minutes\n\n"
                 f"Affected Pairs:\n"
                 f"{pair_lines}\n\n"
@@ -595,9 +679,9 @@ def check_news():
             if tg_resp.status_code == 200:
                 mark_news_sent(event_key)
                 sent.append({
-                    "currency": currency,
-                    "event": event_name,
-                    "minutes_until": minutes_until
+                    "currency": item["currency"],
+                    "event": item["event"],
+                    "minutes_until": minutes_until,
                 })
 
         return jsonify({"ok": True, "sent_count": len(sent), "sent": sent}), 200
@@ -657,6 +741,153 @@ def process_lotsize_command(text: str):
     )
 
 
+def get_latest_signal(pair: str):
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT * FROM trade_events
+        WHERE pair = ? AND event_type = 'SETUP'
+        ORDER BY event_time_utc DESC
+        LIMIT 1
+    """, (pair,))
+    setup_row = cur.fetchone()
+
+    if not setup_row:
+        conn.close()
+        return None
+
+    setup_time = setup_row["event_time_utc"]
+    direction = setup_row["direction"]
+
+    cur.execute("""
+        SELECT * FROM trade_events
+        WHERE pair = ?
+          AND direction = ?
+          AND event_time_utc >= ?
+          AND event_type IN ('TP_HIT', 'TP1_HIT', 'SL_HIT', 'BE_HIT', 'MOVE_TO_BE')
+        ORDER BY event_time_utc DESC
+        LIMIT 1
+    """, (pair, direction, setup_time))
+    latest_followup = cur.fetchone()
+
+    conn.close()
+
+    status = "ACTIVE"
+    if latest_followup:
+        latest_type = normalize_event_type(latest_followup["event_type"])
+        if latest_type == "TP_HIT":
+            status = "TP"
+        elif latest_type == "SL_HIT":
+            status = "SL"
+        elif latest_type == "BE_HIT":
+            status = "BE HIT"
+        elif latest_type == "MOVE_TO_BE":
+            status = "MOVE TO BE"
+
+    return {
+        "pair": pair,
+        "direction": setup_row["direction"],
+        "entry": setup_row["entry"],
+        "stop_price": setup_row["stop_price"],
+        "target_price": setup_row["target_price"],
+        "time": setup_row["event_time_utc"],
+        "status": status,
+    }
+
+
+def build_signal_lookup_message(pair: str):
+    result = get_latest_signal(pair)
+    if not result:
+        return f"No saved signal found for {pair}."
+
+    dt = parse_tv_time(result["time"])
+    return (
+        f"Latest {pair} Signal\n\n"
+        f"Direction: {result['direction']}\n"
+        f"Entry: {result['entry']}\n"
+        f"SL: {result['stop_price']}\n"
+        f"TP: {result['target_price']}\n\n"
+        f"Status: {result['status']}\n"
+        f"Time: {format_timestamp(dt)}"
+    )
+
+
+def build_best_pair_message():
+    rows = fetch_rows_since(None)
+
+    if not rows:
+        return "No trade data available yet."
+
+    by_pair = {}
+
+    for row in rows:
+        pair = row["pair"]
+        if not pair:
+            continue
+
+        if pair not in by_pair:
+            by_pair[pair] = {
+                "tp": 0,
+                "sl": 0,
+                "be": 0,
+                "net_pips": 0.0,
+                "resolved": 0,
+            }
+
+        event_type = normalize_event_type(row["event_type"])
+
+        if event_type == "TP_HIT":
+            by_pair[pair]["tp"] += 1
+            by_pair[pair]["resolved"] += 1
+            by_pair[pair]["net_pips"] += float(row["target_pips"] or 0.0)
+        elif event_type == "SL_HIT":
+            by_pair[pair]["sl"] += 1
+            by_pair[pair]["resolved"] += 1
+            by_pair[pair]["net_pips"] -= float(row["stop_pips"] or 0.0)
+        elif event_type == "BE_HIT":
+            by_pair[pair]["be"] += 1
+            by_pair[pair]["resolved"] += 1
+
+    ranked = [(pair, stats) for pair, stats in by_pair.items() if stats["resolved"] > 0]
+    if not ranked:
+        return "No resolved pair performance data available yet."
+
+    ranked.sort(key=lambda x: x[1]["net_pips"], reverse=True)
+    pair, stats = ranked[0]
+
+    win_rate = (stats["tp"] / stats["resolved"] * 100.0) if stats["resolved"] > 0 else 0.0
+
+    return (
+        f"Best Performing Pair\n\n"
+        f"{pair}\n\n"
+        f"TP: {stats['tp']}\n"
+        f"SL: {stats['sl']}\n"
+        f"BE: {stats['be']}\n\n"
+        f"Win Rate: {win_rate:.1f}%\n"
+        f"Net Pips: {stats['net_pips']:+.2f}"
+    )
+
+
+def build_next_news_message():
+    items = get_high_impact_events()
+    if not items:
+        return "No upcoming high impact news found."
+
+    item = items[0]
+    pair_lines = "\n".join([f"• {p}" for p in item["affected_pairs"]])
+
+    return (
+        f"Next High Impact News\n\n"
+        f"{item['event']}\n"
+        f"{item['currency']}\n"
+        f"{format_timestamp(item['time'])}\n"
+        f"In: {item['minutes_until']} minutes\n\n"
+        f"Affected Pairs:\n"
+        f"{pair_lines}"
+    )
+
+
 @app.route("/telegram-webhook", methods=["POST"])
 def telegram_webhook():
     try:
@@ -670,46 +901,86 @@ def telegram_webhook():
         chat = message.get("chat", {})
         chat_id = str(chat.get("id", ""))
         thread_id = message.get("message_thread_id")
+        from_user = message.get("from", {})
+        user_id = from_user.get("id")
+        is_bot_user = from_user.get("is_bot", False)
+        message_id = message.get("message_id")
 
         if chat_id != CHAT_ID:
             return jsonify({"ok": True, "ignored": "wrong_chat"}), 200
 
-        if text.startswith("/help"):
-            help_text = (
-                "Available Commands\n\n"
-                "/help\n"
-                "/daily\n"
-                "/weekly\n"
-                "/lotsize PAIR RISK STOP_PIPS\n\n"
-                "Example:\n"
-                "/lotsize EURCHF 200 25"
-            )
-            send_telegram_message(help_text, thread_id=thread_id)
-            return jsonify({"ok": True}), 200
+        if is_bot_user:
+            return jsonify({"ok": True, "ignored": "bot_message"}), 200
 
-        if text.startswith("/daily"):
-            _, report = build_report("📊 DAILY RESULTS", days=1)
-            send_telegram_message(report, thread_id=thread_id)
-            return jsonify({"ok": True}), 200
+        admin = is_admin(user_id) if user_id else False
 
-        if text.startswith("/weekly"):
-            _, report = build_report("📊 WEEKLY RESULTS", days=7)
-            send_telegram_message(report, thread_id=thread_id)
-            return jsonify({"ok": True}), 200
-
-        if text.startswith("/lotsize"):
-            if thread_id != LOT_SIZE_TOPIC:
-                send_telegram_message(
-                    "Use /lotsize inside the LOT SIZE topic.",
-                    thread_id=thread_id
+        # Commands
+        if text.startswith("/"):
+            if text.startswith("/help"):
+                help_text = (
+                    "Available Commands\n\n"
+                    "/help\n"
+                    "/daily\n"
+                    "/weekly\n"
+                    "/stats\n"
+                    "/nextnews\n"
+                    "/signal PAIR\n"
+                    "/bestpair\n"
+                    "/lotsize PAIR RISK STOP_PIPS"
                 )
-                return jsonify({"ok": True}), 200
+                send_telegram_message(help_text, thread_id=thread_id)
 
-            result = process_lotsize_command(text)
-            send_telegram_message(result, thread_id=thread_id)
-            return jsonify({"ok": True}), 200
+            elif text.startswith("/daily"):
+                _, report = build_report("📊 DAILY RESULTS", days=1)
+                send_telegram_message(report, thread_id=thread_id)
 
-        return jsonify({"ok": True, "ignored": "no_command"}), 200
+            elif text.startswith("/weekly"):
+                _, report = build_report("📊 WEEKLY RESULTS", days=7)
+                send_telegram_message(report, thread_id=thread_id)
+
+            elif text.startswith("/stats"):
+                _, report = build_report("📊 SIGNAL STATISTICS", days=None)
+                send_telegram_message(report, thread_id=thread_id)
+
+            elif text.startswith("/nextnews"):
+                send_telegram_message(build_next_news_message(), thread_id=thread_id)
+
+            elif text.startswith("/bestpair"):
+                send_telegram_message(build_best_pair_message(), thread_id=thread_id)
+
+            elif text.startswith("/signal"):
+                parts = text.split()
+                if len(parts) != 2:
+                    send_telegram_message(
+                        "Usage:\n/signal PAIR\n\nExample:\n/signal EURCHF",
+                        thread_id=thread_id,
+                    )
+                else:
+                    pair = parts[1].upper().strip()
+                    send_telegram_message(build_signal_lookup_message(pair), thread_id=thread_id)
+
+            elif text.startswith("/lotsize"):
+                if thread_id != LOT_SIZE_TOPIC:
+                    send_telegram_message(
+                        "Use /lotsize inside the LOT SIZE topic.",
+                        thread_id=thread_id,
+                    )
+                else:
+                    result = process_lotsize_command(text)
+                    send_telegram_message(result, thread_id=thread_id)
+
+            if (not admin) and (thread_id in PROTECTED_TOPICS) and message_id:
+                delete_telegram_message(message_id)
+
+            return jsonify({"ok": True, "handled": "command"}), 200
+
+        # Non-command moderation
+        if (not admin) and (thread_id in PROTECTED_TOPICS):
+            if message_id:
+                delete_telegram_message(message_id)
+            return jsonify({"ok": True, "handled": "deleted_non_admin_message"}), 200
+
+        return jsonify({"ok": True, "ignored": "no_action"}), 200
 
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
