@@ -891,14 +891,37 @@ def telegram_webhook():
             return jsonify({"ok": True, "handled": "deleted_non_admin_message"}), 200
 
         if text.startswith("/"):
-            if text.startswith("/help"):
+            if text.startswith("/helpadmin"):
+                if not admin:
+                    send_telegram_message("❌ Admin only command", thread_id=thread_id)
+                else:
+                    help_text = (
+                        "Admin Commands\n\n"
+                        "/helpadmin\n"
+                        "/addreturn PAIR RISK PROFIT MAXDD DAYS RR TRADES\n"
+                        "/deletereturn PAIR\n"
+                        "/resetpair PAIR\n"
+                        "/resetstats"
+                    )
+                    send_telegram_message(help_text, thread_id=thread_id)
+
+            elif text.startswith("/help"):
                 help_text = (
-                    "Available Commands\n\n/help\n/daily\n/weekly\n/stats\n/nextnews\n/todaynews\n"
-                    "/marketnews [text]\n/goldupdates [text]\n/oilupdates [text]\n/marketbias [text]\n"
-                    "/signal PAIR\n/bestpair\n/ranking\n/pairstatus PAIR\n/return PAIR\n"
-                    "/expectedreturns\n/lotsize PAIR RISK STOP_PIPS\n"
-                    "/addreturn PAIR RISK PROFIT MAXDD DAYS RR TRADES\n/deletereturn PAIR\n"
-                    "/resetpair PAIR\n/resetstats"
+                    "Available Commands\n\n"
+                    "/help\n"
+                    "/daily\n"
+                    "/weekly\n"
+                    "/stats\n"
+                    "/nextnews\n"
+                    "/todaynews\n"
+                    "/marketnews\n"
+                    "/signal PAIR\n"
+                    "/bestpair\n"
+                    "/ranking\n"
+                    "/pairstatus PAIR\n"
+                    "/return PAIR\n"
+                    "/expectedreturns\n"
+                    "/lotsize PAIR RISK STOP_PIPS"
                 )
                 send_telegram_message(help_text, thread_id=thread_id)
 
@@ -913,11 +936,21 @@ def telegram_webhook():
             elif text.startswith("/todaynews") or text.startswith("/todaysnews"):
                 send_telegram_message(build_todays_news_message(), thread_id=thread_id)
             elif text.startswith("/marketnews"):
-                msg = text.replace("/marketnews", "", 1).strip()
-                if not msg:
-                    send_telegram_message("Usage:\n/marketnews [text]\n\nExample:\n/marketnews US data strong → USD bullish", thread_id=thread_id)
-                else:
-                    send_telegram_message(f"🌐 MARKET NEWS\n\n{msg}", thread_id=MARKET_NEWS_TOPIC)
+                gold = fetch_mediastack_news("gold OR xauusd OR bullion", limit=2)
+                oil = fetch_mediastack_news("oil OR crude OR brent", limit=2)
+
+                def format_items(items):
+                    return "\n".join([f"• {i.get('title', '')}" for i in items if i.get("title")]) or "No news found."
+
+                message = (
+                    "🌐 MARKET NEWS\n\n"
+                    "🟡 Gold:\n"
+                    f"{format_items(gold)}\n\n"
+                    "🛢 Oil:\n"
+                    f"{format_items(oil)}"
+                )
+
+                send_telegram_message(message, thread_id=thread_id)
             elif text.startswith("/goldupdates"):
                 msg = text.replace("/goldupdates", "", 1).strip()
                 if not msg:
