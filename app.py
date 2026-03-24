@@ -632,7 +632,7 @@ def build_market_news_post(prefix: str, title: str, source: str):
 def run_auto_market_news():
     sent = []
     feeds = [
-        ("gold OR xauusd OR bullion OR precious metals", "🟡 GOLD UPDATE", "gold"),
+        ("gold OR xauusd OR inflation OR fed OR precious metals", "🟡 GOLD UPDATE", "gold"),
         ("oil OR crude OR wti OR brent OR opec", "🛢 OIL UPDATE", "oil"),
         ("iran OR israel OR war OR conflict OR sanctions OR missile", "⚡ MACRO UPDATE", "macro"),
     ]
@@ -936,18 +936,27 @@ def telegram_webhook():
             elif text.startswith("/todaynews") or text.startswith("/todaysnews"):
                 send_telegram_message(build_todays_news_message(), thread_id=thread_id)
             elif text.startswith("/marketnews"):
-                gold = fetch_mediastack_news("gold OR xauusd OR bullion", limit=2)
-                oil = fetch_mediastack_news("oil OR crude OR brent", limit=2)
+                gold = fetch_mediastack_news("gold OR xauusd OR inflation OR fed", limit=2)
+                oil = fetch_mediastack_news("oil OR crude OR brent OR opec", limit=2)
 
                 def format_items(items):
                     return "\n".join([f"• {i.get('title', '')}" for i in items if i.get("title")]) or "No news found."
 
+                macro = fetch_mediastack_news("war OR conflict OR geopolitics OR economy", limit=2)
+
+                def format_items(items, empty_msg):
+                    if not items:
+                        return empty_msg
+                    return "\n".join([f"• {i.get('title','')}" for i in items if i.get("title")])
+
                 message = (
                     "🌐 MARKET NEWS\n\n"
                     "🟡 Gold:\n"
-                    f"{format_items(gold)}\n\n"
+                    f"{format_items(gold, 'No major news — market relatively quiet')}\n\n"
                     "🛢 Oil:\n"
-                    f"{format_items(oil)}"
+                    f"{format_items(oil, 'No major news — market stable')}\n\n"
+                    "🌍 Macro:\n"
+                    f"{format_items(macro, 'No major geopolitical headlines')}"
                 )
 
                 send_telegram_message(message, thread_id=thread_id)
