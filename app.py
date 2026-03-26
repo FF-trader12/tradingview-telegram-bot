@@ -64,6 +64,7 @@ NEWS_RULES = {
 }
 DB_PATH = "signals.db"
 VERSION = "ff-signals-bot-v4-market-news"
+PENDING_SIGNAL_MAX_AGE_MINUTES = int(os.environ.get("PENDING_SIGNAL_MAX_AGE_MINUTES", "5") or 5)
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -217,8 +218,12 @@ def store_pending_signal(data: dict, signal_id: str):
     conn.commit(); conn.close()
 
 def get_pending_signals(limit: int = 50):
+    expire_old_pending_signals()
     conn = get_db(); cur = conn.cursor()
-    cur.execute("""SELECT * FROM pending_signals WHERE status = 'pending' ORDER BY id ASC LIMIT ?""", (limit,))
+    cur.execute("""SELECT * FROM pending_signals
+                   WHERE status = 'pending'
+                   ORDER BY id ASC
+                   LIMIT ?""", (limit,))
     rows = cur.fetchall(); conn.close()
     return rows
 
@@ -228,6 +233,46 @@ def acknowledge_signal(signal_id: str):
                 (now_utc().isoformat(), signal_id))
     conn.commit(); updated = cur.rowcount; conn.close()
     return updated > 0
+
+def expire_old_pending_signals(max_age_minutes=None):
+    if max_age_minutes is None:
+        max_age_minutes = PENDING_SIGNAL_MAX_AGE_MINUTES
+    cutoff = (now_utc() - timedelta(minutes=max_age_minutes)).isoformat()
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("""UPDATE pending_signals
+                   SET status = 'expired', acknowledged_at_utc = ?
+                   WHERE status = 'pending' AND created_at_utc < ?""",
+                (now_utc().isoformat(), cutoff))
+    conn.commit()
+    updated = cur.rowcount
+    conn.close()
+    return updated
+
+def resolve_pending_signals_for_pair(pair: str, direction: str = None):
+    conn = get_db(); cur = conn.cursor()
+    if direction:
+        cur.execute("""UPDATE pending_signals
+                       SET status = 'resolved', acknowledged_at_utc = ?
+                       WHERE status = 'pending' AND pair = ? AND
+                             json_extract(payload_json, '$.direction') = ?""",
+                    (now_utc().isoformat(), pair, direction))
+    else:
+        cur.execute("""UPDATE pending_signals
+                       SET status = 'resolved', acknowledged_at_utc = ?
+                       WHERE status = 'pending' AND pair = ?""",
+                    (now_utc().isoformat(), pair))
+    conn.commit()
+    updated = cur.rowcount
+    conn.close()
+    return updated
+
+def clear_all_pending_signals():
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("DELETE FROM pending_signals WHERE status = 'pending'")
+    conn.commit()
+    deleted = cur.rowcount
+    conn.close()
+    return deleted
 
 def market_item_already_sent(item_key: str) -> bool:
     conn = get_db(); cur = conn.cursor()
@@ -738,13 +783,24 @@ def webhook():
             stop_pips=to_float(data.get("stop_pips")), target_price=to_float(data.get("target_price")),
             target_pips=to_float(data.get("target_pips")), risk="", lot_size="", rr=str(data.get("rr", "")).strip(),
         )
-        if event_type == "SETUP": store_pending_signal(data, signal_id)
+        if event_type == "SETUP":
+            store_pending_signal(data, signal_id)
+        elif event_type in {"TP_HIT", "SL_HIT", "BE_HIT", "MOVE_TO_BE"}:
+            resolve_pending_signals_for_pair(pair, direction)
         topic = TOPIC_MAP.get(pair); message = build_signal_message(data)
         tg_resp = send_telegram_message(message, thread_id=topic)
         if tg_resp.status_code != 200:
             return jsonify({"ok": False, "error": "Telegram send failed"}), 502
         mark_webhook_processed(signal_id, event_type)
         return jsonify({"ok": True, "status": "sent", "signal_id": signal_id}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/ea/clear-pending", methods=["GET", "POST"])
+def ea_clear_pending():
+    try:
+        deleted = clear_all_pending_signals()
+        return jsonify({"ok": True, "deleted_pending": deleted}), 200
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -938,10 +994,6 @@ def telegram_webhook():
             elif text.startswith("/marketnews"):
                 gold = fetch_mediastack_news("gold OR xauusd OR inflation OR fed", limit=2)
                 oil = fetch_mediastack_news("oil OR crude OR brent OR opec", limit=2)
-
-                def format_items(items):
-                    return "\n".join([f"• {i.get('title', '')}" for i in items if i.get("title")]) or "No news found."
-
                 macro = fetch_mediastack_news("war OR conflict OR geopolitics OR economy", limit=2)
 
                 def format_items(items, empty_msg):
