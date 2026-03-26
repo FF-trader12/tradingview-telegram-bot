@@ -812,12 +812,26 @@ def ea_health():
 def ea_pending_signals():
     try:
         limit = to_int(request.args.get("limit", "50")) or 50
-        rows = get_pending_signals(limit); signals = []
+        rows = get_pending_signals(limit)
+        signals = []
+
         for row in rows:
             payload = json.loads(row["payload_json"])
-            payload["status"] = row["status"]; payload["created_at_utc"] = row["created_at_utc"]
+
+            payload["status"] = row["status"]
+            payload["created_at_utc"] = row["created_at_utc"]
+
+            # CLEAN TIMESTAMP FOR MT5
+            try:
+                dt = datetime.fromisoformat(row["created_at_utc"])
+                payload["created_at_mt5"] = dt.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                payload["created_at_mt5"] = row["created_at_utc"]
+
             signals.append(payload)
+
         return jsonify({"ok": True, "signals": signals}), 200
+
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
