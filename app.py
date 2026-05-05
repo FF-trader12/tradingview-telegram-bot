@@ -62,9 +62,13 @@ NEWS_RULES = {
     "UNEMPLOYMENT RATE": {"better": "lower", "currency_positive": True},
     "JOBLESS CLAIMS": {"better": "lower", "currency_positive": True},
 }
-DB_PATH = "signals.db"
-VERSION = "ff-signals-bot-v4-market-news"
+DB_PATH = os.environ.get("DB_PATH") or ("/data/signals.db" if os.path.isdir("/data") else "signals.db")
+VERSION = "ff-signals-bot-v5-licensing-stats"
 PENDING_SIGNAL_MAX_AGE_MINUTES = int(os.environ.get("PENDING_SIGNAL_MAX_AGE_MINUTES", "5") or 5)
+ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "").strip()
+REQUIRE_EA_LICENSE = os.environ.get("REQUIRE_EA_LICENSE", "false").lower().strip() in {"1", "true", "yes", "on"}
+
+os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -93,6 +97,42 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT, item_key TEXT UNIQUE, sent_at_utc TEXT NOT NULL)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS sent_market_open (
         id INTEGER PRIMARY KEY AUTOINCREMENT, session_date_key TEXT UNIQUE, sent_at_utc TEXT NOT NULL)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS licences (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        licence_key TEXT UNIQUE NOT NULL,
+        customer_name TEXT,
+        customer_email TEXT,
+        mt5_account TEXT,
+        broker_server TEXT,
+        active INTEGER NOT NULL DEFAULT 1,
+        expires_at_utc TEXT,
+        notes TEXT,
+        created_at_utc TEXT NOT NULL,
+        updated_at_utc TEXT NOT NULL,
+        last_checked_at_utc TEXT
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS ea_trade_updates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        licence_key TEXT,
+        mt5_account TEXT,
+        broker_server TEXT,
+        signal_id TEXT,
+        ticket TEXT,
+        pair TEXT,
+        direction TEXT,
+        action TEXT,
+        status TEXT,
+        lot_size REAL,
+        open_price REAL,
+        close_price REAL,
+        stop_loss REAL,
+        take_profit REAL,
+        profit REAL,
+        profit_pips REAL,
+        comment TEXT,
+        event_time_utc TEXT NOT NULL,
+        created_at_utc TEXT NOT NULL
+    )""")
     conn.commit(); conn.close()
 
 init_db()
@@ -166,6 +206,121 @@ def normalize_event_type(event_type: str) -> str:
 def webhook_secret_valid(data: dict) -> bool:
     if not WEBHOOK_SECRET: return True
     return str(data.get("secret", "")).strip() == WEBHOOK_SECRET
+
+def admin_api_valid(req) -> bool:
+    if not ADMIN_API_KEY:
+        return False
+    supplied = req.headers.get("X-Admin-Key", "") or req.args.get("admin_key", "")
+    return str(supplied).strip() == ADMIN_API_KEY
+
+def get_request_payload():
+    if request.method == "GET":
+        return request.args.to_dict()
+    return request.get_json(silent=True) or {}
+
+def parse_expiry(expires_at):
+    raw = str(expires_at or "").strip()
+    if not raw:
+        return None
+    try:
+        if len(raw) == 10:
+            return datetime.fromisoformat(raw + "T23:59:59+00:00")
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def validate_licence(licence_key, mt5_account=None, broker_server=None):
+    licence_key = str(licence_key or "").strip()
+    mt5_account = str(mt5_account or "").strip()
+    broker_server = str(broker_server or "").strip()
+    if not licence_key:
+        return False, "Missing licence_key", None
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT * FROM licences WHERE licence_key = ? LIMIT 1", (licence_key,))
+    row = cur.fetchone()
+    if not row:
+        conn.close(); return False, "Invalid licence_key", None
+    cur.execute("UPDATE licences SET last_checked_at_utc = ?, updated_at_utc = ? WHERE licence_key = ?",
+                (now_utc().isoformat(), now_utc().isoformat(), licence_key))
+    conn.commit(); conn.close()
+    if int(row["active"] or 0) != 1:
+        return False, "Licence inactive", row
+    expiry = parse_expiry(row["expires_at_utc"])
+    if expiry and now_utc() > expiry:
+        return False, "Licence expired", row
+    saved_account = str(row["mt5_account"] or "").strip()
+    if saved_account and mt5_account and saved_account != mt5_account:
+        return False, "MT5 account not authorised", row
+    if saved_account and not mt5_account:
+        return False, "Missing mt5_account", row
+    saved_broker = str(row["broker_server"] or "").strip()
+    if saved_broker and broker_server and saved_broker.lower() != broker_server.lower():
+        return False, "Broker server not authorised", row
+    return True, "Licence valid", row
+
+def ea_access_allowed(payload):
+    if not REQUIRE_EA_LICENSE:
+        return True, {"licence_required": False}
+    ok, reason, row = validate_licence(
+        payload.get("licence_key") or payload.get("license_key"),
+        payload.get("mt5_account") or payload.get("account"),
+        payload.get("broker_server") or payload.get("broker")
+    )
+    return ok, {"licence_required": True, "reason": reason, "licence": dict(row) if row else None}
+
+def save_ea_trade_update(data: dict):
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("""INSERT INTO ea_trade_updates (
+        licence_key, mt5_account, broker_server, signal_id, ticket, pair, direction, action, status,
+        lot_size, open_price, close_price, stop_loss, take_profit, profit, profit_pips, comment,
+        event_time_utc, created_at_utc
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
+        str(data.get("licence_key") or data.get("license_key") or "").strip(),
+        str(data.get("mt5_account") or data.get("account") or "").strip(),
+        str(data.get("broker_server") or data.get("broker") or "").strip(),
+        str(data.get("signal_id") or "").strip(),
+        str(data.get("ticket") or "").strip(),
+        str(data.get("pair") or data.get("symbol") or "").upper().strip(),
+        str(data.get("direction") or "").upper().strip(),
+        str(data.get("action") or "").upper().strip(),
+        str(data.get("status") or "").upper().strip(),
+        to_float(data.get("lot_size") or data.get("lots")),
+        to_float(data.get("open_price") or data.get("entry")),
+        to_float(data.get("close_price")),
+        to_float(data.get("stop_loss") or data.get("sl")),
+        to_float(data.get("take_profit") or data.get("tp")),
+        to_float(data.get("profit") or data.get("profit_money")),
+        to_float(data.get("profit_pips") or data.get("pips")),
+        str(data.get("comment") or "").strip(),
+        parse_tv_time(data.get("event_time") or data.get("time")).isoformat(),
+        now_utc().isoformat(),
+    ))
+    conn.commit(); new_id = cur.lastrowid; conn.close()
+    return new_id
+
+def build_ea_stats_summary(licence_key=None, mt5_account=None):
+    where = []
+    params = []
+    if licence_key:
+        where.append("licence_key = ?"); params.append(licence_key)
+    if mt5_account:
+        where.append("mt5_account = ?"); params.append(str(mt5_account))
+    sql_where = (" WHERE " + " AND ".join(where)) if where else ""
+    conn = get_db(); cur = conn.cursor()
+    cur.execute(f"""SELECT COUNT(*) AS updates,
+                          SUM(CASE WHEN status IN ('CLOSED','TP','SL','BE') OR action = 'CLOSE' THEN 1 ELSE 0 END) AS closed_trades,
+                          SUM(CASE WHEN profit > 0 THEN 1 ELSE 0 END) AS wins,
+                          SUM(CASE WHEN profit < 0 THEN 1 ELSE 0 END) AS losses,
+                          COALESCE(SUM(profit), 0) AS total_profit,
+                          COALESCE(SUM(profit_pips), 0) AS total_pips
+                   FROM ea_trade_updates{sql_where}""", params)
+    row = cur.fetchone(); conn.close()
+    wins = int(row["wins"] or 0); losses = int(row["losses"] or 0)
+    win_rate = (wins / (wins + losses) * 100) if (wins + losses) else 0
+    return {"updates": int(row["updates"] or 0), "closed_trades": int(row["closed_trades"] or 0),
+            "wins": wins, "losses": losses, "win_rate": round(win_rate, 2),
+            "total_profit": round(float(row["total_profit"] or 0), 2),
+            "total_pips": round(float(row["total_pips"] or 0), 2)}
 
 def build_signal_id(data: dict) -> str:
     supplied = str(data.get("signal_id", "")).strip()
@@ -796,9 +951,114 @@ def webhook():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+
+@app.route("/ea/check-licence", methods=["GET", "POST"])
+@app.route("/ea/check-license", methods=["GET", "POST"])
+def ea_check_licence():
+    try:
+        data = get_request_payload()
+        ok, reason, row = validate_licence(
+            data.get("licence_key") or data.get("license_key"),
+            data.get("mt5_account") or data.get("account"),
+            data.get("broker_server") or data.get("broker")
+        )
+        return jsonify({"ok": True, "valid": ok, "reason": reason,
+                        "active": bool(row["active"]) if row else False,
+                        "expires_at_utc": row["expires_at_utc"] if row else None}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "valid": False, "error": str(e)}), 500
+
+@app.route("/ea/trade-update", methods=["POST"])
+def ea_trade_update():
+    try:
+        data = request.get_json(force=True)
+        allowed, info = ea_access_allowed(data)
+        if not allowed:
+            return jsonify({"ok": False, "error": info.get("reason", "Licence check failed")}), 403
+        update_id = save_ea_trade_update(data)
+        stats = build_ea_stats_summary(data.get("licence_key") or data.get("license_key"), data.get("mt5_account") or data.get("account"))
+        return jsonify({"ok": True, "saved": True, "update_id": update_id, "stats": stats}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/ea/stats", methods=["GET", "POST"])
+def ea_stats():
+    try:
+        data = get_request_payload()
+        allowed, info = ea_access_allowed(data)
+        if not allowed:
+            return jsonify({"ok": False, "error": info.get("reason", "Licence check failed")}), 403
+        stats = build_ea_stats_summary(data.get("licence_key") or data.get("license_key"), data.get("mt5_account") or data.get("account"))
+        return jsonify({"ok": True, **stats}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/admin/licences/create", methods=["POST"])
+@app.route("/admin/licenses/create", methods=["POST"])
+def admin_create_licence():
+    try:
+        if not admin_api_valid(request):
+            return jsonify({"ok": False, "error": "Invalid admin key"}), 403
+        data = request.get_json(force=True)
+        licence_key = str(data.get("licence_key") or data.get("license_key") or "").strip()
+        if not licence_key:
+            return jsonify({"ok": False, "error": "Missing licence_key"}), 400
+        now_iso = now_utc().isoformat()
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("""INSERT INTO licences (
+            licence_key, customer_name, customer_email, mt5_account, broker_server, active, expires_at_utc, notes, created_at_utc, updated_at_utc
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(licence_key) DO UPDATE SET
+            customer_name = excluded.customer_name, customer_email = excluded.customer_email,
+            mt5_account = excluded.mt5_account, broker_server = excluded.broker_server,
+            active = excluded.active, expires_at_utc = excluded.expires_at_utc,
+            notes = excluded.notes, updated_at_utc = excluded.updated_at_utc""", (
+            licence_key, str(data.get("customer_name") or "").strip(), str(data.get("customer_email") or "").strip(),
+            str(data.get("mt5_account") or data.get("account") or "").strip(),
+            str(data.get("broker_server") or data.get("broker") or "").strip(),
+            1 if data.get("active", True) else 0, str(data.get("expires_at_utc") or data.get("expires") or "").strip(),
+            str(data.get("notes") or "").strip(), now_iso, now_iso
+        ))
+        conn.commit(); conn.close()
+        return jsonify({"ok": True, "licence_key": licence_key, "saved": True}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/admin/licences/deactivate", methods=["POST"])
+@app.route("/admin/licenses/deactivate", methods=["POST"])
+def admin_deactivate_licence():
+    try:
+        if not admin_api_valid(request):
+            return jsonify({"ok": False, "error": "Invalid admin key"}), 403
+        data = request.get_json(force=True)
+        licence_key = str(data.get("licence_key") or data.get("license_key") or "").strip()
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("UPDATE licences SET active = 0, updated_at_utc = ? WHERE licence_key = ?", (now_utc().isoformat(), licence_key))
+        conn.commit(); updated = cur.rowcount; conn.close()
+        return jsonify({"ok": True, "deactivated": updated > 0, "licence_key": licence_key}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/admin/licences/list", methods=["GET"])
+@app.route("/admin/licenses/list", methods=["GET"])
+def admin_list_licences():
+    try:
+        if not admin_api_valid(request):
+            return jsonify({"ok": False, "error": "Invalid admin key"}), 403
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("SELECT licence_key, customer_name, customer_email, mt5_account, broker_server, active, expires_at_utc, created_at_utc, last_checked_at_utc FROM licences ORDER BY id DESC")
+        rows = [dict(r) for r in cur.fetchall()]; conn.close()
+        return jsonify({"ok": True, "licences": rows}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 @app.route("/ea/clear-pending", methods=["GET", "POST"])
 def ea_clear_pending():
     try:
+        payload = get_request_payload()
+        allowed, info = ea_access_allowed(payload)
+        if not allowed:
+            return jsonify({"ok": False, "error": info.get("reason", "Licence check failed")}), 403
         deleted = clear_all_pending_signals()
         return jsonify({"ok": True, "deleted_pending": deleted}), 200
     except Exception as e:
@@ -811,6 +1071,10 @@ def ea_health():
 @app.route("/ea/pending-signals", methods=["GET"])
 def ea_pending_signals():
     try:
+        payload = get_request_payload()
+        allowed, info = ea_access_allowed(payload)
+        if not allowed:
+            return jsonify({"ok": False, "error": info.get("reason", "Licence check failed")}), 403
         limit = to_int(request.args.get("limit", "50")) or 50
         rows = get_pending_signals(limit)
         signals = []
@@ -839,6 +1103,9 @@ def ea_pending_signals():
 def ea_ack():
     try:
         data = request.get_json(force=True)
+        allowed, info = ea_access_allowed(data)
+        if not allowed:
+            return jsonify({"ok": False, "error": info.get("reason", "Licence check failed")}), 403
         signal_id = str(data.get("signal_id", "")).strip()
         if not signal_id:
             return jsonify({"ok": False, "error": "Missing signal_id"}), 400
