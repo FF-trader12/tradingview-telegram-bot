@@ -1,1399 +1,1112 @@
 from flask import Flask, request, jsonify
 import os
-import sqlite3
-from datetime import datetime, timezone, timedelta
 import requests
-import json
-import hashlib
+from datetime import datetime, timezone
 
 app = Flask(__name__)
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-TE_API_KEY = os.environ.get("TE_API_KEY", "guest:guest")
-MEDIASTACK_API_KEY = os.environ.get("MEDIASTACK_API_KEY", "").strip()
-CHAT_ID = "-1003759221413"
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
+# =========================
+# THE BLACK BOOK v0.2
+# Football scanner using The Odds API
+# =========================
 
-HIGH_IMPACT_NEWS_TOPIC = 58
-MARKET_NEWS_TOPIC = 59
-LOT_SIZE_TOPIC = 63
-RESULTS_TOPIC = int(os.environ.get("RESULTS_TOPIC", "0") or 0)
+BOT_TOKEN = (
+    os.environ.get("TELEGRAM_BOT_TOKEN")
+    or os.environ.get("BOT_TOKEN")
+    or ""
+).strip()
 
-TOPIC_MAP = {
-    "EURCHF": 3, "AUDCAD": 2, "EURNZD": 14, "EURAUD": 16, "XAUUSD": 17,
-    "GBPJPY": 18, "EURUSD": 22, "EURGBP": 25, "AUDJPY": 28, "AUDNZD": 29,
-    "XAGUSD": 70, "CADJPY": 72, "EURJPY": 74, "USDCHF": 76, "USDCAD": 78,
-    "GBPUSD": 80, "DE40": 82,
-}
-PROTECTED_TOPICS = set(TOPIC_MAP.values()) | {HIGH_IMPACT_NEWS_TOPIC, MARKET_NEWS_TOPIC}
+ODDS_API_KEY = os.environ.get("THE_ODDS_API_KEY", "").strip()
 
-PAIR_EMOJI = {"XAUUSD": "🥇", "XAGUSD": "🥈", "DE40": "📊"}
-PIP_VALUE_MAP = {
-    "GBPJPY": 0.4764, "AUDJPY": 0.4749, "CADJPY": 0.4749, "EURJPY": 0.4750,
-    "EURAUD": 0.5297, "AUDCAD": 0.5492, "EURGBP": 1.0, "AUDNZD": 0.4405,
-    "AUDCHF": 0.9598, "CADCHF": 0.9598, "USDCHF": 0.9598, "EURUSD": 0.7503,
-    "EURNZD": 0.4423, "XAUUSD": 0.7445, "XAGUSD": 0.3721, "USDCAD": 0.5484,
-    "GBPUSD": 0.7439, "EURCHF": 0.9567,
-}
-CURRENCY_TO_PAIRS = {
-    "EUR": ["EURCHF", "EURNZD", "EURAUD", "EURUSD", "EURGBP", "EURJPY"],
-    "AUD": ["AUDCAD", "AUDJPY", "AUDNZD", "EURAUD"],
-    "NZD": ["EURNZD", "AUDNZD"],
-    "USD": ["XAUUSD", "EURUSD", "USDCHF", "USDCAD", "GBPUSD", "XAGUSD"],
-    "GBP": ["GBPJPY", "EURGBP", "GBPUSD"],
-    "JPY": ["GBPJPY", "AUDJPY", "CADJPY", "EURJPY"],
-    "CAD": ["AUDCAD", "CADJPY", "USDCAD"],
-    "CHF": ["EURCHF", "USDCHF"],
-}
-EVENT_ALIASES = {
-    "SETUP": "SETUP", "TP1_HIT": "TP_HIT", "TP_HIT": "TP_HIT",
-    "SL_HIT": "SL_HIT", "MOVE_TO_BE": "MOVE_TO_BE", "BE_HIT": "BE_HIT",
-    "PAIR_STATS": "PAIR_STATS",
-}
-NEWS_RULES = {
-    "CPI": {"better": "higher", "currency_positive": True},
-    "INFLATION": {"better": "higher", "currency_positive": True},
-    "CORE CPI": {"better": "higher", "currency_positive": True},
-    "NFP": {"better": "higher", "currency_positive": True},
-    "NON FARM PAYROLLS": {"better": "higher", "currency_positive": True},
-    "GDP": {"better": "higher", "currency_positive": True},
-    "RETAIL SALES": {"better": "higher", "currency_positive": True},
-    "PMI": {"better": "higher", "currency_positive": True},
-    "UNEMPLOYMENT RATE": {"better": "lower", "currency_positive": True},
-    "JOBLESS CLAIMS": {"better": "lower", "currency_positive": True},
-}
-DB_PATH = os.environ.get("DB_PATH") or ("/data/signals.db" if os.path.isdir("/data") else "signals.db")
-VERSION = "ff-signals-bot-v5-licensing-stats"
-PENDING_SIGNAL_MAX_AGE_MINUTES = int(os.environ.get("PENDING_SIGNAL_MAX_AGE_MINUTES", "5") or 5)
-ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "").strip()
-REQUIRE_EA_LICENSE = os.environ.get("REQUIRE_EA_LICENSE", "false").lower().strip() in {"1", "true", "yes", "on"}
+VERSION = "the-black-book-v0.2.1-football-scanner"
 
-os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+# Telegram topic routing
+MAIN_CHAT_ID = os.environ.get("MAIN_CHAT_ID", "-1004368159147").strip()
+FOOTBALL_CHAT_ID = os.environ.get("FOOTBALL_CHAT_ID", MAIN_CHAT_ID).strip()
+FOOTBALL_TOPIC_ID = int(os.environ.get("FOOTBALL_TOPIC_ID", "13") or 13)
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+RACING_TOPIC_ID = int(os.environ.get("RACING_TOPIC_ID", "11") or 11)
+RUGBY_TOPIC_ID = int(os.environ.get("RUGBY_TOPIC_ID", "15") or 15)
 
-def init_db():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS trade_events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, event_time_utc TEXT NOT NULL, pair TEXT,
-        direction TEXT, event_type TEXT, timeframe TEXT, entry REAL, stop_price REAL,
-        stop_pips REAL, target_price REAL, target_pips REAL, risk TEXT, lot_size TEXT, rr TEXT)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS sent_news_events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, event_key TEXT UNIQUE, sent_at_utc TEXT NOT NULL)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS pair_returns (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, pair TEXT UNIQUE, risk_pct REAL, profit_pct REAL,
-        max_drawdown_pct REAL, days INTEGER, rr REAL, trades INTEGER, updated_at_utc TEXT NOT NULL)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS processed_webhooks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, signal_id TEXT UNIQUE, event_type TEXT, created_at_utc TEXT NOT NULL)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS pending_signals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, signal_id TEXT UNIQUE, pair TEXT NOT NULL,
-        payload_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
-        created_at_utc TEXT NOT NULL, acknowledged_at_utc TEXT)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS sent_market_news (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, item_key TEXT UNIQUE, sent_at_utc TEXT NOT NULL)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS sent_market_open (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, session_date_key TEXT UNIQUE, sent_at_utc TEXT NOT NULL)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS licences (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        licence_key TEXT UNIQUE NOT NULL,
-        customer_name TEXT,
-        customer_email TEXT,
-        mt5_account TEXT,
-        broker_server TEXT,
-        active INTEGER NOT NULL DEFAULT 1,
-        expires_at_utc TEXT,
-        notes TEXT,
-        created_at_utc TEXT NOT NULL,
-        updated_at_utc TEXT NOT NULL,
-        last_checked_at_utc TEXT
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS ea_trade_updates (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        licence_key TEXT,
-        mt5_account TEXT,
-        broker_server TEXT,
-        signal_id TEXT,
-        ticket TEXT,
-        pair TEXT,
-        direction TEXT,
-        action TEXT,
-        status TEXT,
-        lot_size REAL,
-        open_price REAL,
-        close_price REAL,
-        stop_loss REAL,
-        take_profit REAL,
-        profit REAL,
-        profit_pips REAL,
-        comment TEXT,
-        event_time_utc TEXT NOT NULL,
-        created_at_utc TEXT NOT NULL
-    )""")
-    conn.commit(); conn.close()
+# Scanner settings
+MIN_FOOTBALL_SCORE = int(os.environ.get("MIN_FOOTBALL_SCORE", "78") or 78)
+MAX_FOOTBALL_POSTS = int(os.environ.get("MAX_FOOTBALL_POSTS", "3") or 3)
 
-init_db()
+# Keep this controlled so the free Odds API credits do not get burned.
+FOOTBALL_SPORT_KEYS = [
+    x.strip()
+    for x in os.environ.get(
+        "FOOTBALL_SPORT_KEYS",
+        "soccer_epl,soccer_uefa_champs_league,soccer_uefa_europa_league,soccer_fifa_world_cup"
+    ).split(",")
+    if x.strip()
+]
+
+ODDS_REGION = os.environ.get("ODDS_REGION", "uk")
+ODDS_MARKETS = os.environ.get("ODDS_MARKETS", "h2h")
+
+
+# =========================
+# Telegram helpers
+# =========================
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+def api_url(method: str) -> str:
+    return f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+
+
+def send_telegram_message(chat_id, text: str, thread_id=None):
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+
+    if thread_id is not None:
+        payload["message_thread_id"] = thread_id
+
+    return requests.post(api_url("sendMessage"), json=payload, timeout=20)
+
+
+def send_to_football_topic(text: str):
+    return send_telegram_message(
+        FOOTBALL_CHAT_ID,
+        text,
+        thread_id=FOOTBALL_TOPIC_ID,
+    )
+
+
+# =========================
+# Formatting helpers
+# =========================
+
+def money(amount):
+    try:
+        value = float(amount)
+    except Exception:
+        return "£0"
+
+    if value == int(value):
+        return f"£{int(value)}"
+    return f"£{value:.2f}"
+
+
+def decimal_to_fractional(decimal_odds):
+    try:
+        decimal_odds = float(decimal_odds)
+    except Exception:
+        return "N/A"
+
+    if decimal_odds <= 1:
+        return "N/A"
+
+    profit = decimal_odds - 1
+    best_num = 1
+    best_den = 1
+    best_error = abs(profit - 1)
+
+    for den in range(1, 21):
+        num = round(profit * den)
+        if num <= 0:
+            continue
+
+        error = abs(profit - (num / den))
+        if error < best_error:
+            best_error = error
+            best_num = num
+            best_den = den
+
+    return f"{best_num}/{best_den}"
+
+
+def format_odds(decimal_odds):
+    try:
+        decimal_odds = float(decimal_odds)
+        return f"{decimal_to_fractional(decimal_odds)} ({decimal_odds:.2f})"
+    except Exception:
+        return "N/A"
+
+
+def implied_probability(decimal_odds):
+    try:
+        decimal_odds = float(decimal_odds)
+        if decimal_odds <= 0:
+            return 0
+        return 1 / decimal_odds
+    except Exception:
+        return 0
+
+
+def safe_float(value, default=None):
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def kickoff_text(commence_time):
+    raw = str(commence_time or "").strip()
+    if not raw:
+        return "Unknown"
+
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt.strftime("%d %b %H:%M UTC")
+    except Exception:
+        return raw
+
+
+# =========================
+# Odds API helpers
+# =========================
+
+def odds_api_get(path, params=None):
+    if not ODDS_API_KEY:
+        raise ValueError("Missing THE_ODDS_API_KEY in Render environment variables.")
+
+    url = f"https://api.the-odds-api.com/v4{path}"
+    final_params = params.copy() if params else {}
+    final_params["apiKey"] = ODDS_API_KEY
+
+    response = requests.get(url, params=final_params, timeout=25)
+
+    # Invalid sport key, no need to crash the whole scan.
+    if response.status_code == 404:
+        return None
+
+    response.raise_for_status()
+    return response.json()
+
+
+def get_active_sports():
+    return odds_api_get("/sports", params={}) or []
+
+
+def get_available_soccer_sports():
+    soccer = []
+
+    try:
+        sports = get_active_sports()
+    except Exception:
+        return soccer
+
+    for item in sports:
+        key = item.get("key", "")
+        group = item.get("group", "")
+        active = item.get("active", False)
+
+        if active and ("soccer" in key.lower() or group.lower() == "soccer"):
+            soccer.append({
+                "key": key,
+                "title": item.get("title", key),
+                "description": item.get("description", ""),
+            })
+
+    return soccer
+
+
+def clean_api_error(error_text):
+    """Keep Telegram errors readable and never expose API keys in chat."""
+    text = str(error_text)
+
+    if "apiKey=" in text:
+        text = text.split("apiKey=")[0] + "apiKey=HIDDEN"
+
+    if "422 Client Error" in text:
+        return "Market not supported for this league with current settings"
+
+    if "401 Client Error" in text:
+        return "API key issue - check THE_ODDS_API_KEY"
+
+    if "429 Client Error" in text:
+        return "Odds API credit/rate limit hit"
+
+    if len(text) > 140:
+        text = text[:140] + "..."
+
+    return text
+
+
+def fetch_football_odds():
+    all_events = []
+    errors = []
+
+    for sport_key in FOOTBALL_SPORT_KEYS:
+        try:
+            data = odds_api_get(
+                f"/sports/{sport_key}/odds",
+                params={
+                    "regions": ODDS_REGION,
+                    "markets": ODDS_MARKETS,
+                    "oddsFormat": "decimal",
+                    "dateFormat": "iso",
+                },
+            )
+
+            if not data:
+                continue
+
+            for event in data:
+                event["sport_key_used"] = sport_key
+                all_events.append(event)
+
+        except Exception as e:
+            errors.append(f"{sport_key}: {clean_api_error(e)}")
+
+    return all_events, errors
+
+
+# =========================
+# Market extraction
+# =========================
+
+def get_best_market_prices(event):
+    home = event.get("home_team", "")
+    away = event.get("away_team", "")
+
+    prices = {
+        "home": None,
+        "away": None,
+        "draw": None,
+        "over_25": None,
+        "under_25": None,
+        "btts_yes": None,
+        "btts_no": None,
+        "bookmakers": set(),
+    }
+
+    for bookmaker in event.get("bookmakers", []):
+        title = bookmaker.get("title", bookmaker.get("key", "Bookmaker"))
+        prices["bookmakers"].add(title)
+
+        for market in bookmaker.get("markets", []):
+            key = market.get("key")
+
+            for outcome in market.get("outcomes", []):
+                name = outcome.get("name")
+                price = safe_float(outcome.get("price"))
+                point = safe_float(outcome.get("point"))
+
+                if price is None:
+                    continue
+
+                if key == "h2h":
+                    if name == home:
+                        if prices["home"] is None or price > prices["home"]["price"]:
+                            prices["home"] = {"name": name, "price": price, "bookmaker": title}
+                    elif name == away:
+                        if prices["away"] is None or price > prices["away"]["price"]:
+                            prices["away"] = {"name": name, "price": price, "bookmaker": title}
+                    elif str(name).lower() == "draw":
+                        if prices["draw"] is None or price > prices["draw"]["price"]:
+                            prices["draw"] = {"name": name, "price": price, "bookmaker": title}
+
+                elif key == "totals" and point is not None and abs(point - 2.5) < 0.01:
+                    if str(name).lower() == "over":
+                        if prices["over_25"] is None or price > prices["over_25"]["price"]:
+                            prices["over_25"] = {"name": "Over 2.5 Goals", "price": price, "bookmaker": title}
+                    elif str(name).lower() == "under":
+                        if prices["under_25"] is None or price > prices["under_25"]["price"]:
+                            prices["under_25"] = {"name": "Under 2.5 Goals", "price": price, "bookmaker": title}
+
+                elif key == "btts":
+                    if str(name).lower() == "yes":
+                        if prices["btts_yes"] is None or price > prices["btts_yes"]["price"]:
+                            prices["btts_yes"] = {"name": "BTTS Yes", "price": price, "bookmaker": title}
+                    elif str(name).lower() == "no":
+                        if prices["btts_no"] is None or price > prices["btts_no"]["price"]:
+                            prices["btts_no"] = {"name": "BTTS No", "price": price, "bookmaker": title}
+
+    prices["bookmaker_count"] = len(prices["bookmakers"])
+    prices["bookmakers"] = sorted(list(prices["bookmakers"]))
+
+    return prices
+
+
+def choose_favourite(prices):
+    home = prices.get("home")
+    away = prices.get("away")
+
+    if not home or not away:
+        return None
+
+    if home["price"] <= away["price"]:
+        return {
+            "team": home["name"],
+            "odds": home["price"],
+            "bookmaker": home["bookmaker"],
+            "side": "home",
+        }
+
+    return {
+        "team": away["name"],
+        "odds": away["price"],
+        "bookmaker": away["bookmaker"],
+        "side": "away",
+    }
+
+
+# =========================
+# Scoring engine
+# =========================
+
+def score_football_event(event):
+    prices = get_best_market_prices(event)
+    favourite = choose_favourite(prices)
+
+    if not favourite:
+        return None
+
+    fav_odds = favourite["odds"]
+    fav_prob = implied_probability(fav_odds)
+
+    score = 0
+    reasons = []
+    warnings = []
+
+    # Favourite strength
+    if fav_prob >= 0.72:
+        score += 28
+        reasons.append("Strong favourite profile")
+    elif fav_prob >= 0.62:
+        score += 24
+        reasons.append("Good favourite profile")
+    elif fav_prob >= 0.54:
+        score += 18
+        reasons.append("Moderate favourite profile")
+    else:
+        score += 8
+        warnings.append("Favourite is not strongly priced")
+
+    # Price sanity
+    if 1.35 <= fav_odds <= 2.10:
+        score += 14
+        reasons.append("Favourite odds inside usable range")
+    elif fav_odds < 1.35:
+        score += 6
+        warnings.append("Favourite odds may be too short")
+    else:
+        score += 4
+        warnings.append("Favourite odds may be too risky")
+
+    # Goals market
+    over_25 = prices.get("over_25")
+    under_25 = prices.get("under_25")
+
+    if over_25 and under_25:
+        over_prob = implied_probability(over_25["price"])
+        under_prob = implied_probability(under_25["price"])
+
+        if over_prob >= under_prob:
+            score += 18
+            reasons.append("Goal market supports an attacking game")
+        elif abs(over_prob - under_prob) <= 0.04:
+            score += 13
+            reasons.append("Goal market is balanced")
+        else:
+            score += 7
+            warnings.append("Goal market leans lower scoring")
+    else:
+        score += 4
+        warnings.append("Limited goal market data")
+
+    # BTTS market
+    btts_yes = prices.get("btts_yes")
+    btts_no = prices.get("btts_no")
+
+    if btts_yes and btts_no:
+        yes_prob = implied_probability(btts_yes["price"])
+        no_prob = implied_probability(btts_no["price"])
+
+        if yes_prob >= no_prob:
+            score += 12
+            reasons.append("BTTS market supports both teams scoring")
+        else:
+            score += 9
+            reasons.append("BTTS market supports cleaner favourite script")
+    else:
+        score += 3
+        warnings.append("Limited BTTS market data")
+
+    # Bookmaker coverage
+    bookmaker_count = prices.get("bookmaker_count", 0)
+
+    if bookmaker_count >= 5:
+        score += 14
+        reasons.append("Multiple bookmakers available")
+    elif bookmaker_count >= 3:
+        score += 10
+        reasons.append("Reasonable bookmaker coverage")
+    elif bookmaker_count >= 1:
+        score += 5
+        warnings.append("Limited bookmaker coverage")
+
+    # Market coverage
+    available_markets = 0
+    for key in ["home", "away", "draw", "over_25", "under_25", "btts_yes", "btts_no"]:
+        if prices.get(key):
+            available_markets += 1
+
+    if available_markets >= 6:
+        score += 14
+        reasons.append("Good market coverage")
+    elif available_markets >= 4:
+        score += 8
+        reasons.append("Basic market coverage")
+    else:
+        score += 2
+        warnings.append("Not enough markets to build full setup")
+
+    score = min(score, 100)
+
+    if score >= 90:
+        confidence = "ELITE"
+    elif score >= 82:
+        confidence = "HIGH"
+    elif score >= 78:
+        confidence = "GOOD"
+    else:
+        confidence = "NO EDGE"
+
+    return {
+        "event": event,
+        "prices": prices,
+        "favourite": favourite,
+        "score": score,
+        "confidence": confidence,
+        "reasons": reasons,
+        "warnings": warnings,
+    }
+
+
+# =========================
+# Bet setup generation
+# =========================
+
+def build_bet_section(label, stake, odds, legs, purpose, bookmaker=None, include=True):
+    if not include or odds is None or not legs:
+        return ""
+
+    return (
+        f"{label}\n"
+        f"Stake: <b>{money(stake)}</b>\n"
+        f"Odds: <b>{format_odds(odds)}</b>\n"
+        f"Return: <b>{money(float(stake) * float(odds))}</b>\n"
+        + (f"Bookmaker: <b>{bookmaker}</b>\n" if bookmaker else "")
+        + "\n"
+        f"<b>Bet:</b>\n"
+        + "\n".join([f"• {leg}" for leg in legs])
+        + "\n\n"
+        f"Purpose: {purpose}\n"
+    )
+
+
+def generate_football_builds(scored):
+    prices = scored["prices"]
+    fav = scored["favourite"]
+
+    fav_team = fav["team"]
+    fav_odds = fav["odds"]
+
+    over_25 = prices.get("over_25")
+    under_25 = prices.get("under_25")
+    btts_yes = prices.get("btts_yes")
+    btts_no = prices.get("btts_no")
+
+    sections = []
+
+    # SAFE
+    safe_legs = []
+    safe_odds = None
+    safe_bookmaker = None
+
+    if fav_odds <= 1.95:
+        safe_legs = [f"{fav_team} To Win"]
+        safe_odds = fav_odds
+        safe_bookmaker = fav["bookmaker"]
+    elif over_25 and over_25["price"] <= 1.95:
+        safe_legs = ["Over 2.5 Goals"]
+        safe_odds = over_25["price"]
+        safe_bookmaker = over_25["bookmaker"]
+    elif btts_yes and btts_yes["price"] <= 1.95:
+        safe_legs = ["BTTS Yes"]
+        safe_odds = btts_yes["price"]
+        safe_bookmaker = btts_yes["bookmaker"]
+
+    sections.append(build_bet_section(
+        "🟢 <b>SAFE</b>",
+        10,
+        safe_odds,
+        safe_legs,
+        "Highest probability angle from the available market.",
+        bookmaker=safe_bookmaker,
+        include=safe_odds is not None,
+    ))
+
+    # VALUE
+    value_legs = []
+    value_odds = None
+    value_bookmaker = None
+
+    if over_25 and 1.75 <= over_25["price"] <= 2.40:
+        value_legs = ["Over 2.5 Goals"]
+        value_odds = over_25["price"]
+        value_bookmaker = over_25["bookmaker"]
+    elif btts_yes and 1.75 <= btts_yes["price"] <= 2.50:
+        value_legs = ["BTTS Yes"]
+        value_odds = btts_yes["price"]
+        value_bookmaker = btts_yes["bookmaker"]
+    elif 1.85 <= fav_odds <= 2.60:
+        value_legs = [f"{fav_team} To Win"]
+        value_odds = fav_odds
+        value_bookmaker = fav["bookmaker"]
+
+    sections.append(build_bet_section(
+        "🟡 <b>VALUE ⭐</b>",
+        10,
+        value_odds,
+        value_legs,
+        "Best risk/reward angle from the available market.",
+        bookmaker=value_bookmaker,
+        include=value_odds is not None,
+    ))
+
+    # COVER
+    cover_legs = []
+    cover_odds = None
+    cover_bookmaker = None
+
+    if btts_no and fav_odds <= 1.90:
+        cover_legs = ["BTTS No"]
+        cover_odds = btts_no["price"]
+        cover_bookmaker = btts_no["bookmaker"]
+    elif under_25 and under_25["price"] <= 2.40:
+        cover_legs = ["Under 2.5 Goals"]
+        cover_odds = under_25["price"]
+        cover_bookmaker = under_25["bookmaker"]
+    elif prices.get("draw") and 2.80 <= prices["draw"]["price"] <= 4.20:
+        cover_legs = ["Draw"]
+        cover_odds = prices["draw"]["price"]
+        cover_bookmaker = prices["draw"]["bookmaker"]
+
+    sections.append(build_bet_section(
+        "🔵 <b>COVER</b>",
+        4,
+        cover_odds,
+        cover_legs,
+        "Alternative route if the main value angle does not play out.",
+        bookmaker=cover_bookmaker,
+        include=cover_odds is not None,
+    ))
+
+    # RISKY
+    risky_legs = []
+    risky_odds = None
+
+    # The Odds API gives single-market odds, not same-game bet builder odds.
+    # This is an estimated combo using available market odds and is marked clearly.
+    if fav_odds and over_25 and btts_yes:
+        risky_legs = [
+            f"{fav_team} To Win",
+            "Over 2.5 Goals",
+            "BTTS Yes",
+        ]
+        risky_odds = round(fav_odds * over_25["price"] * btts_yes["price"], 2)
+
+    if risky_odds and 5.0 <= risky_odds <= 15.0:
+        sections.append(build_bet_section(
+            "🔴 <b>RISKY ⚠️</b>",
+            3,
+            risky_odds,
+            risky_legs,
+            "High-risk estimated combo. Small stake only.",
+            bookmaker="Estimated",
+            include=True,
+        ))
+
+    return [section for section in sections if section.strip()]
+
+
+def build_football_setup_message(scored):
+    event = scored["event"]
+    prices = scored["prices"]
+    fav = scored["favourite"]
+
+    home = event.get("home_team", "Home")
+    away = event.get("away_team", "Away")
+    sport_key = event.get("sport_key_used", event.get("sport_key", "football"))
+    kickoff = kickoff_text(event.get("commence_time"))
+
+    sections = generate_football_builds(scored)
+
+    if not sections:
+        return None
+
+    reasons = scored["reasons"][:4]
+    warnings = scored["warnings"][:3]
+
+    reason_block = "\n".join([f"• {r}" for r in reasons]) if reasons else "• Market data supports the setup"
+
+    warning_block = ""
+    if warnings:
+        warning_block = "\n\n<b>Warnings:</b>\n" + "\n".join([f"⚠️ {w}" for w in warnings])
+
+    bot_play = "Best Single: <b>🟢 SAFE</b>"
+    if any("VALUE" in section for section in sections):
+        bot_play = "Best Single: <b>🟡 VALUE</b>"
+
+    return (
+        "⚽ <b>THE BLACK BOOK FOOTBALL</b>\n\n"
+        "🔥 <b>SETUP FOUND</b>\n\n"
+        f"Competition: <code>{sport_key}</code>\n"
+        f"Match: <b>{home} vs {away}</b>\n"
+        f"Kickoff: <b>{kickoff}</b>\n\n"
+        f"Setup Score: <b>{scored['score']}/100</b>\n"
+        f"Confidence: <b>{scored['confidence']}</b>\n"
+        f"Favourite: <b>{fav['team']}</b>\n"
+        f"Bookmakers Found: <b>{prices.get('bookmaker_count', 0)}</b>\n\n"
+        "━━━━━━━━━━━━━━\n\n"
+        + "\n━━━━━━━━━━━━━━\n\n".join(sections)
+        + "\n━━━━━━━━━━━━━━\n\n"
+        "🤖 <b>BOT PLAY</b>\n"
+        f"{bot_play}\n\n"
+        "<b>Why it qualified:</b>\n"
+        f"{reason_block}"
+        f"{warning_block}\n\n"
+        "Find The Edge.\n\n"
+        "<i>Note: RISKY combo odds are estimated from available single-market odds unless stated otherwise.</i>"
+    )
+
+
+# =========================
+# Scanner runner
+# =========================
+
+def scan_football():
+    events, errors = fetch_football_odds()
+    scored_events = []
+
+    for event in events:
+        scored = score_football_event(event)
+
+        if not scored:
+            continue
+
+        if scored["score"] < MIN_FOOTBALL_SCORE:
+            continue
+
+        message = build_football_setup_message(scored)
+
+        if not message:
+            continue
+
+        scored["message"] = message
+        scored_events.append(scored)
+
+    scored_events.sort(key=lambda item: item["score"], reverse=True)
+
+    return scored_events[:MAX_FOOTBALL_POSTS], errors, len(events)
+
+
+def run_football_scan(post_to_topic=True):
+    setups, errors, scanned_count = scan_football()
+
+    posts_sent = 0
+    send_errors = []
+
+    if post_to_topic:
+        for setup in setups:
+            response = send_to_football_topic(setup["message"])
+
+            if response.status_code == 200:
+                posts_sent += 1
+            else:
+                send_errors.append(response.text)
+
+    summary = (
+        "📖 <b>THE BLACK BOOK SCAN COMPLETE</b>\n\n"
+        f"⚽ Fixtures scanned: <b>{scanned_count}</b>\n"
+        f"🔥 Setups found: <b>{len(setups)}</b>\n"
+        f"📤 Posts sent: <b>{posts_sent}</b>\n"
+        f"🎯 Market mode: <b>{ODDS_MARKETS}</b>\n\n"
+    )
+
+    if not setups:
+        summary += "No qualifying football setups found.\n"
+
+    if errors:
+        summary += "\n<b>API notes:</b>\n"
+        for err in errors[:4]:
+            summary += f"• {err}\n"
+
+    if send_errors:
+        summary += "\n<b>Telegram send errors:</b>\n"
+        for err in send_errors[:2]:
+            summary += f"• {clean_api_error(err)}\n"
+
+    return {
+        "setups": setups,
+        "errors": errors,
+        "scanned_count": scanned_count,
+        "posts_sent": posts_sent,
+        "summary": summary,
+    }
+
+
+# =========================
+# Bot messages
+# =========================
+
+def build_start_message():
+    return (
+        "📖 <b>THE BLACK BOOK</b>\n\n"
+        "Bot Status: <b>ONLINE ✅</b>\n"
+        f"Version: <b>{VERSION}</b>\n\n"
+        "Commands:\n"
+        "• /scan - Run all active scanners\n"
+        "• /scanfootball - Scan football only\n"
+        "• /sports - Show available soccer sport keys\n"
+        "• /top - Demo SAFE / VALUE / COVER / RISKY setup\n"
+        "• /risky - Demo risky setup only\n"
+        "• /chatid - Show current chat/topic ID\n"
+        "• /help - Show help menu\n\n"
+        "Find The Edge."
+    )
+
+
+def build_help_message():
+    return (
+        "📖 <b>THE BLACK BOOK HELP</b>\n\n"
+        "<b>Available Commands</b>\n\n"
+        "• /start - Bot intro\n"
+        "• /scan - Run all active scanners\n"
+        "• /scanfootball - Scan football only\n"
+        "• /sports - Show available soccer sport keys from Odds API\n"
+        "• /top - Demo SAFE / VALUE / COVER / RISKY setup\n"
+        "• /risky - Demo risky setup only\n"
+        "• /chatid - Show current chat/topic ID\n"
+        "• /help - Show this menu\n\n"
+        "<b>Current Status</b>\n"
+        "• Football scanner active\n"
+        "• Racing scanner planned\n"
+        "• Rugby scanner planned\n\n"
+        "<b>Posting Rule</b>\n"
+        "No edge = no post."
+    )
+
+
+def build_top_message():
+    return (
+        "📖 <b>THE BLACK BOOK</b>\n\n"
+        "🔥 <b>TOP DEMO SETUP</b>\n\n"
+        "Match: <b>England vs Croatia</b>\n"
+        "Setup Score: <b>84%</b>\n"
+        "Confidence: <b>HIGH</b>\n\n"
+        "━━━━━━━━━━━━━━\n\n"
+        "🟢 <b>SAFE</b>\n"
+        "Stake: <b>£10</b>\n"
+        "Odds: <b>2/1</b>\n"
+        "Return: <b>£30</b>\n\n"
+        "<b>Bet:</b>\n"
+        "• Over 1.5 Goals\n"
+        "• Over 4.5 Corners\n"
+        "• England Over 0.5 Goals\n\n"
+        "Purpose: Highest probability setup.\n\n"
+        "━━━━━━━━━━━━━━\n\n"
+        "🟡 <b>VALUE ⭐</b>\n"
+        "Stake: <b>£10</b>\n"
+        "Odds: <b>7/2</b>\n"
+        "Return: <b>£45</b>\n\n"
+        "<b>Bet:</b>\n"
+        "• Both Teams To Score\n"
+        "• Over 2.5 Goals\n"
+        "• Over 4.5 Corners\n\n"
+        "Purpose: Best risk/reward setup.\n\n"
+        "━━━━━━━━━━━━━━\n\n"
+        "🔵 <b>COVER</b>\n"
+        "Stake: <b>£4</b>\n"
+        "Odds: <b>6/4</b>\n"
+        "Return: <b>£10</b>\n\n"
+        "<b>Bet:</b>\n"
+        "• England Over 1.5 Team Goals\n\n"
+        "Purpose: Can win with the value bet and can still cover if the value bet fails.\n\n"
+        "━━━━━━━━━━━━━━\n\n"
+        "🔴 <b>RISKY ⚠️</b>\n"
+        "Stake: <b>£3</b>\n"
+        "Odds: <b>10/1</b>\n"
+        "Return: <b>£33</b>\n\n"
+        "<b>Bet:</b>\n"
+        "• England Win\n"
+        "• Kane Anytime Scorer\n"
+        "• BTTS Yes\n"
+        "• Over 2.5 Goals\n\n"
+        "⚠️ High risk / low probability / bigger return.\n\n"
+        "━━━━━━━━━━━━━━\n\n"
+        "🤖 <b>BOT PLAY</b>\n"
+        "Best Single Bet: <b>🟡 VALUE</b>\n"
+        "Best Combo: <b>🟡 VALUE + 🔵 COVER</b>\n\n"
+        "Responsible note: this is demo output only. No outcome is guaranteed."
+    )
+
+
+def build_risky_message():
+    return (
+        "📖 <b>THE BLACK BOOK</b>\n\n"
+        "🔴 <b>RISKY ⚠️ DEMO SETUP</b>\n\n"
+        "Match: <b>England vs Croatia</b>\n\n"
+        "Stake: <b>£3</b>\n"
+        "Odds: <b>10/1</b>\n"
+        "Return: <b>£33</b>\n\n"
+        "<b>Bet:</b>\n"
+        "• England Win\n"
+        "• Kane Anytime Scorer\n"
+        "• BTTS Yes\n"
+        "• Over 2.5 Goals\n\n"
+        "Risk Level: <b>HIGH</b>\n\n"
+        "⚠️ This section is for small-stake, high-return setups only."
+    )
+
+
+def build_chatid_message(chat_id, thread_id):
+    return (
+        "📖 <b>THE BLACK BOOK CHAT ID</b>\n\n"
+        f"Chat ID: <code>{chat_id}</code>\n"
+        f"Topic ID: <code>{thread_id}</code>\n\n"
+        "Use these IDs later for routing sport alerts into the correct topic."
+    )
+
+
+def build_sports_message():
+    soccer = get_available_soccer_sports()
+
+    if not soccer:
+        return (
+            "⚽ <b>FOOTBALL LEAGUES</b>\n\n"
+            "Could not load soccer sport keys from The Odds API.\n"
+            "Check THE_ODDS_API_KEY or try again later."
+        )
+
+    preferred = [
+        "soccer_epl",
+        "soccer_fifa_world_cup",
+        "soccer_italy_serie_a",
+        "soccer_germany_dfb_pokal",
+        "soccer_sweden_allsvenskan",
+        "soccer_norway_eliteserien",
+        "soccer_league_of_ireland",
+        "soccer_conmebol_copa_libertadores",
+        "soccer_conmebol_copa_sudamericana",
+    ]
+
+    by_key = {item["key"]: item for item in soccer}
+    enabled = [key for key in FOOTBALL_SPORT_KEYS if key in by_key]
+
+    lines = [
+        "⚽ <b>FOOTBALL LEAGUES</b>",
+        "",
+        "<b>Currently scanning:</b>",
+    ]
+
+    if enabled:
+        for key in enabled:
+            item = by_key[key]
+            lines.append(f"✅ <b>{item['title']}</b>\n<code>{key}</code>")
+    else:
+        lines.append("No active scanned leagues matched the API list.")
+
+    lines.append("")
+    lines.append("<b>Recommended available keys:</b>")
+
+    count = 0
+    for key in preferred:
+        if key in by_key:
+            item = by_key[key]
+            lines.append(f"• <b>{item['title']}</b>\n<code>{key}</code>")
+            count += 1
+
+    if count == 0:
+        for item in soccer[:8]:
+            lines.append(f"• <b>{item['title']}</b>\n<code>{item['key']}</code>")
+
+    lines.append("")
+    lines.append("Render variable:")
+    lines.append("<code>FOOTBALL_SPORT_KEYS</code>")
+
+    return "\n".join(lines)
+
+
+# =========================
+# Flask routes
+# =========================
 
 @app.route("/", methods=["GET"])
 def home():
-    return "TradingView Telegram Bot is running", 200
+    return "The Black Book Bot is running", 200
+
 
 @app.route("/version", methods=["GET"])
 def version():
     return VERSION, 200
 
-def now_utc():
-    return datetime.now(timezone.utc)
 
-def api_url(method: str) -> str:
-    return f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({
+        "ok": True,
+        "version": VERSION,
+        "utc": now_utc().isoformat(),
+        "bot_token_loaded": bool(BOT_TOKEN),
+        "odds_api_loaded": bool(ODDS_API_KEY),
+        "football_chat_id": FOOTBALL_CHAT_ID,
+        "football_topic_id": FOOTBALL_TOPIC_ID,
+        "min_football_score": MIN_FOOTBALL_SCORE,
+        "football_sport_keys": FOOTBALL_SPORT_KEYS,
+    }), 200
 
-def format_tf(tf) -> str:
-    tf = str(tf or "").strip()
-    if tf.isdigit(): return f"{tf}m"
-    tf_upper = tf.upper()
-    if tf_upper in {"D", "W", "M"}: return tf_upper
-    return tf
 
-def parse_tv_time(raw_time):
-    raw_time = str(raw_time or "").strip()
-    if not raw_time: return now_utc()
-    if raw_time.isdigit():
-        try:
-            ts = int(raw_time)
-            if ts > 10_000_000_000: ts = ts / 1000.0
-            return datetime.fromtimestamp(ts, tz=timezone.utc)
-        except Exception: pass
-    try:
-        dt = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
-        return (dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc))
-    except Exception:
-        return now_utc()
+@app.route("/set-webhook", methods=["GET"])
+def set_webhook():
+    if not BOT_TOKEN:
+        return jsonify({"ok": False, "error": "Missing TELEGRAM_BOT_TOKEN or BOT_TOKEN"}), 500
 
-def parse_calendar_time(raw):
-    raw = str(raw or "").strip()
-    if not raw: return None
-    try:
-        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        return (dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc))
-    except Exception:
-        return None
+    webhook_url = request.host_url.rstrip("/") + "/telegram-webhook"
+    webhook_url = webhook_url.replace("http://", "https://", 1)
 
-def format_timestamp(dt) -> str:
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-def get_session(dt) -> str:
-    hour = dt.astimezone(timezone.utc).hour
-    if 0 <= hour < 7: return "Asia"
-    if 7 <= hour < 13: return "London"
-    if 13 <= hour < 22: return "New York"
-    return "After Hours"
-
-def to_float(value):
-    try: return float(str(value).strip().replace(",", ""))
-    except Exception: return None
-
-def to_int(value):
-    try: return int(float(str(value).strip()))
-    except Exception: return None
-
-def normalize_event_type(event_type: str) -> str:
-    return EVENT_ALIASES.get(str(event_type or "SETUP").upper().strip(), str(event_type or "SETUP").upper().strip())
-
-def webhook_secret_valid(data: dict) -> bool:
-    if not WEBHOOK_SECRET: return True
-    return str(data.get("secret", "")).strip() == WEBHOOK_SECRET
-
-def admin_api_valid(req) -> bool:
-    if not ADMIN_API_KEY:
-        return False
-    supplied = req.headers.get("X-Admin-Key", "") or req.args.get("admin_key", "")
-    return str(supplied).strip() == ADMIN_API_KEY
-
-def get_request_payload():
-    if request.method == "GET":
-        return request.args.to_dict()
-    return request.get_json(silent=True) or {}
-
-def parse_expiry(expires_at):
-    raw = str(expires_at or "").strip()
-    if not raw:
-        return None
-    try:
-        if len(raw) == 10:
-            return datetime.fromisoformat(raw + "T23:59:59+00:00")
-        return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
-    except Exception:
-        return None
-
-def validate_licence(licence_key, mt5_account=None, broker_server=None):
-    licence_key = str(licence_key or "").strip()
-    mt5_account = str(mt5_account or "").strip()
-    broker_server = str(broker_server or "").strip()
-    if not licence_key:
-        return False, "Missing licence_key", None
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("SELECT * FROM licences WHERE licence_key = ? LIMIT 1", (licence_key,))
-    row = cur.fetchone()
-    if not row:
-        conn.close(); return False, "Invalid licence_key", None
-    cur.execute("UPDATE licences SET last_checked_at_utc = ?, updated_at_utc = ? WHERE licence_key = ?",
-                (now_utc().isoformat(), now_utc().isoformat(), licence_key))
-    conn.commit(); conn.close()
-    if int(row["active"] or 0) != 1:
-        return False, "Licence inactive", row
-    expiry = parse_expiry(row["expires_at_utc"])
-    if expiry and now_utc() > expiry:
-        return False, "Licence expired", row
-    saved_account = str(row["mt5_account"] or "").strip()
-    if saved_account and mt5_account and saved_account != mt5_account:
-        return False, "MT5 account not authorised", row
-    if saved_account and not mt5_account:
-        return False, "Missing mt5_account", row
-    saved_broker = str(row["broker_server"] or "").strip()
-    if saved_broker and broker_server and saved_broker.lower() != broker_server.lower():
-        return False, "Broker server not authorised", row
-    return True, "Licence valid", row
-
-def ea_access_allowed(payload):
-    if not REQUIRE_EA_LICENSE:
-        return True, {"licence_required": False}
-    ok, reason, row = validate_licence(
-        payload.get("licence_key") or payload.get("license_key"),
-        payload.get("mt5_account") or payload.get("account"),
-        payload.get("broker_server") or payload.get("broker")
+    response = requests.post(
+        api_url("setWebhook"),
+        json={"url": webhook_url},
+        timeout=15,
     )
-    return ok, {"licence_required": True, "reason": reason, "licence": dict(row) if row else None}
 
-def save_ea_trade_update(data: dict):
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("""INSERT INTO ea_trade_updates (
-        licence_key, mt5_account, broker_server, signal_id, ticket, pair, direction, action, status,
-        lot_size, open_price, close_price, stop_loss, take_profit, profit, profit_pips, comment,
-        event_time_utc, created_at_utc
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
-        str(data.get("licence_key") or data.get("license_key") or "").strip(),
-        str(data.get("mt5_account") or data.get("account") or "").strip(),
-        str(data.get("broker_server") or data.get("broker") or "").strip(),
-        str(data.get("signal_id") or "").strip(),
-        str(data.get("ticket") or "").strip(),
-        str(data.get("pair") or data.get("symbol") or "").upper().strip(),
-        str(data.get("direction") or "").upper().strip(),
-        str(data.get("action") or "").upper().strip(),
-        str(data.get("status") or "").upper().strip(),
-        to_float(data.get("lot_size") or data.get("lots")),
-        to_float(data.get("open_price") or data.get("entry")),
-        to_float(data.get("close_price")),
-        to_float(data.get("stop_loss") or data.get("sl")),
-        to_float(data.get("take_profit") or data.get("tp")),
-        to_float(data.get("profit") or data.get("profit_money")),
-        to_float(data.get("profit_pips") or data.get("pips")),
-        str(data.get("comment") or "").strip(),
-        parse_tv_time(data.get("event_time") or data.get("time")).isoformat(),
-        now_utc().isoformat(),
-    ))
-    conn.commit(); new_id = cur.lastrowid; conn.close()
-    return new_id
+    return jsonify({
+        "ok": response.status_code == 200,
+        "webhook_url": webhook_url,
+        "telegram_response": response.json(),
+    }), response.status_code
+
+
+@app.route("/delete-webhook", methods=["GET"])
+def delete_webhook():
+    if not BOT_TOKEN:
+        return jsonify({"ok": False, "error": "Missing TELEGRAM_BOT_TOKEN or BOT_TOKEN"}), 500
+
+    response = requests.post(api_url("deleteWebhook"), timeout=15)
+
+    return jsonify({
+        "ok": response.status_code == 200,
+        "telegram_response": response.json(),
+    }), response.status_code
+
+
+@app.route("/scheduled-scan", methods=["GET", "POST"])
+def scheduled_scan():
+    result = run_football_scan(post_to_topic=True)
+
+    return jsonify({
+        "ok": True,
+        "version": VERSION,
+        "scanned_count": result["scanned_count"],
+        "qualifying_setups": len(result["setups"]),
+        "posts_sent": result["posts_sent"],
+        "errors": result["errors"][:5],
+    }), 200
+
+
+@app.route("/scan-football", methods=["GET", "POST"])
+def scan_football_route():
+    result = run_football_scan(post_to_topic=True)
+
+    return jsonify({
+        "ok": True,
+        "version": VERSION,
+        "scanned_count": result["scanned_count"],
+        "qualifying_setups": len(result["setups"]),
+        "posts_sent": result["posts_sent"],
+        "summary": result["summary"],
+        "errors": result["errors"][:5],
+    }), 200
 
-def build_ea_stats_summary(licence_key=None, mt5_account=None):
-    where = []
-    params = []
-    if licence_key:
-        where.append("licence_key = ?"); params.append(licence_key)
-    if mt5_account:
-        where.append("mt5_account = ?"); params.append(str(mt5_account))
-    sql_where = (" WHERE " + " AND ".join(where)) if where else ""
-    conn = get_db(); cur = conn.cursor()
-    cur.execute(f"""SELECT COUNT(*) AS updates,
-                          SUM(CASE WHEN status IN ('CLOSED','TP','SL','BE') OR action = 'CLOSE' THEN 1 ELSE 0 END) AS closed_trades,
-                          SUM(CASE WHEN profit > 0 THEN 1 ELSE 0 END) AS wins,
-                          SUM(CASE WHEN profit < 0 THEN 1 ELSE 0 END) AS losses,
-                          COALESCE(SUM(profit), 0) AS total_profit,
-                          COALESCE(SUM(profit_pips), 0) AS total_pips
-                   FROM ea_trade_updates{sql_where}""", params)
-    row = cur.fetchone(); conn.close()
-    wins = int(row["wins"] or 0); losses = int(row["losses"] or 0)
-    win_rate = (wins / (wins + losses) * 100) if (wins + losses) else 0
-    return {"updates": int(row["updates"] or 0), "closed_trades": int(row["closed_trades"] or 0),
-            "wins": wins, "losses": losses, "win_rate": round(win_rate, 2),
-            "total_profit": round(float(row["total_profit"] or 0), 2),
-            "total_pips": round(float(row["total_pips"] or 0), 2)}
-
-def build_signal_id(data: dict) -> str:
-    supplied = str(data.get("signal_id", "")).strip()
-    if supplied: return supplied
-    raw = "|".join([
-        str(data.get("pair", "")).upper().strip(),
-        str(data.get("direction", "")).upper().strip(),
-        normalize_event_type(data.get("event_type", "SETUP")),
-        str(data.get("time", "")).strip(),
-        str(data.get("entry", "")).strip(),
-        str(data.get("stop_price", "")).strip(),
-        str(data.get("target_price", "")).strip(),
-    ])
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
-
-def webhook_already_processed(signal_id: str) -> bool:
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("SELECT 1 FROM processed_webhooks WHERE signal_id = ? LIMIT 1", (signal_id,))
-    row = cur.fetchone(); conn.close()
-    return row is not None
-
-def mark_webhook_processed(signal_id: str, event_type: str):
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO processed_webhooks (signal_id, event_type, created_at_utc) VALUES (?, ?, ?)",
-                (signal_id, event_type, now_utc().isoformat()))
-    conn.commit(); conn.close()
-
-def store_pending_signal(data: dict, signal_id: str):
-    pair = str(data.get("pair", "")).upper().strip()
-    if not pair: return
-    payload = {
-        "signal_id": signal_id,
-        "pair": pair,
-        "direction": str(data.get("direction", "")).upper().strip(),
-        "event_type": normalize_event_type(data.get("event_type", "SETUP")),
-        "timeframe": format_tf(data.get("timeframe", "")),
-        "time": str(data.get("time", "")).strip(),
-        "entry": data.get("entry"),
-        "stop_price": data.get("stop_price"),
-        "stop_pips": data.get("stop_pips"),
-        "target_price": data.get("target_price"),
-        "target_pips": data.get("target_pips"),
-        "rr": data.get("rr"),
-    }
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("""INSERT OR REPLACE INTO pending_signals
-        (signal_id, pair, payload_json, status, created_at_utc, acknowledged_at_utc)
-        VALUES (?, ?, ?, 'pending', ?, NULL)""",
-        (signal_id, pair, json.dumps(payload), now_utc().isoformat()))
-    conn.commit(); conn.close()
-
-def get_pending_signals(limit: int = 50):
-    expire_old_pending_signals()
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("""SELECT * FROM pending_signals
-                   WHERE status = 'pending'
-                   ORDER BY id ASC
-                   LIMIT ?""", (limit,))
-    rows = cur.fetchall(); conn.close()
-    return rows
-
-def acknowledge_signal(signal_id: str):
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("""UPDATE pending_signals SET status = 'acknowledged', acknowledged_at_utc = ? WHERE signal_id = ?""",
-                (now_utc().isoformat(), signal_id))
-    conn.commit(); updated = cur.rowcount; conn.close()
-    return updated > 0
-
-def expire_old_pending_signals(max_age_minutes=None):
-    if max_age_minutes is None:
-        max_age_minutes = PENDING_SIGNAL_MAX_AGE_MINUTES
-    cutoff = (now_utc() - timedelta(minutes=max_age_minutes)).isoformat()
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("""UPDATE pending_signals
-                   SET status = 'expired', acknowledged_at_utc = ?
-                   WHERE status = 'pending' AND created_at_utc < ?""",
-                (now_utc().isoformat(), cutoff))
-    conn.commit()
-    updated = cur.rowcount
-    conn.close()
-    return updated
-
-def resolve_pending_signals_for_pair(pair: str, direction: str = None):
-    conn = get_db(); cur = conn.cursor()
-    if direction:
-        cur.execute("""UPDATE pending_signals
-                       SET status = 'resolved', acknowledged_at_utc = ?
-                       WHERE status = 'pending' AND pair = ? AND
-                             json_extract(payload_json, '$.direction') = ?""",
-                    (now_utc().isoformat(), pair, direction))
-    else:
-        cur.execute("""UPDATE pending_signals
-                       SET status = 'resolved', acknowledged_at_utc = ?
-                       WHERE status = 'pending' AND pair = ?""",
-                    (now_utc().isoformat(), pair))
-    conn.commit()
-    updated = cur.rowcount
-    conn.close()
-    return updated
-
-def clear_all_pending_signals():
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("DELETE FROM pending_signals WHERE status = 'pending'")
-    conn.commit()
-    deleted = cur.rowcount
-    conn.close()
-    return deleted
-
-def market_item_already_sent(item_key: str) -> bool:
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("SELECT 1 FROM sent_market_news WHERE item_key = ? LIMIT 1", (item_key,))
-    row = cur.fetchone(); conn.close()
-    return row is not None
-
-def mark_market_item_sent(item_key: str):
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO sent_market_news (item_key, sent_at_utc) VALUES (?, ?)",
-                (item_key, now_utc().isoformat()))
-    conn.commit(); conn.close()
-
-def market_open_already_sent(session_date_key: str) -> bool:
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("SELECT 1 FROM sent_market_open WHERE session_date_key = ? LIMIT 1", (session_date_key,))
-    row = cur.fetchone(); conn.close()
-    return row is not None
-
-def mark_market_open_sent(session_date_key: str):
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO sent_market_open (session_date_key, sent_at_utc) VALUES (?, ?)",
-                (session_date_key, now_utc().isoformat()))
-    conn.commit(); conn.close()
-
-def send_telegram_message(text: str, thread_id=None):
-    payload = {"chat_id": CHAT_ID, "text": text}
-    if thread_id is not None: payload["message_thread_id"] = thread_id
-    return requests.post(api_url("sendMessage"), json=payload, timeout=15)
-
-def delete_telegram_message(message_id: int):
-    try:
-        return requests.post(api_url("deleteMessage"), json={"chat_id": CHAT_ID, "message_id": message_id}, timeout=10)
-    except Exception:
-        return None
-
-def is_admin(user_id: int) -> bool:
-    try:
-        resp = requests.post(api_url("getChatMember"), json={"chat_id": CHAT_ID, "user_id": user_id}, timeout=10)
-        if resp.status_code != 200: return False
-        data = resp.json()
-        if not data.get("ok"): return False
-        return data["result"].get("status", "") in {"creator", "administrator"}
-    except Exception:
-        return False
-
-def log_trade_event(event_time_utc, pair, direction, event_type, timeframe, entry, stop_price, stop_pips, target_price, target_pips, risk, lot_size, rr):
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("""INSERT INTO trade_events (
-        event_time_utc, pair, direction, event_type, timeframe, entry, stop_price, stop_pips,
-        target_price, target_pips, risk, lot_size, rr) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (event_time_utc, pair, direction, event_type, timeframe, entry, stop_price, stop_pips, target_price, target_pips, risk, lot_size, rr))
-    conn.commit(); conn.close()
-
-def fetch_rows_since(start_dt=None):
-    conn = get_db(); cur = conn.cursor()
-    if start_dt is None:
-        cur.execute("SELECT * FROM trade_events ORDER BY event_time_utc ASC, id ASC")
-    else:
-        cur.execute("SELECT * FROM trade_events WHERE event_time_utc >= ? ORDER BY event_time_utc ASC, id ASC",
-                    (start_dt.isoformat(),))
-    rows = cur.fetchall(); conn.close()
-    return rows
-
-def get_pair_rows(pair):
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("SELECT * FROM trade_events WHERE pair = ? ORDER BY event_time_utc ASC, id ASC", (pair,))
-    rows = cur.fetchall(); conn.close()
-    return rows
-
-def summarize_rows(rows):
-    total_setups = tp_hits = sl_hits = be_hits = 0
-    pips_won = pips_lost = 0.0
-    for row in rows:
-        event_type = normalize_event_type(row["event_type"])
-        target_pips = float(row["target_pips"] or 0.0)
-        stop_pips = float(row["stop_pips"] or 0.0)
-        if event_type == "SETUP":
-            total_setups += 1
-        elif event_type == "TP_HIT":
-            tp_hits += 1; pips_won += target_pips
-        elif event_type == "SL_HIT":
-            sl_hits += 1; pips_lost += stop_pips
-        elif event_type == "BE_HIT":
-            be_hits += 1
-    resolved_with_be = tp_hits + sl_hits + be_hits
-    resolved_for_winrate = tp_hits + sl_hits
-    win_rate = (tp_hits / resolved_for_winrate * 100.0) if resolved_for_winrate > 0 else 0.0
-    net_pips = pips_won - pips_lost
-    return {
-        "total_setups": total_setups, "tp_hits": tp_hits, "sl_hits": sl_hits, "be_hits": be_hits,
-        "resolved_with_be": resolved_with_be, "resolved_for_winrate": resolved_for_winrate,
-        "win_rate": round(win_rate, 2), "pips_won": round(pips_won, 2),
-        "pips_lost": round(pips_lost, 2), "net_pips": round(net_pips, 2),
-    }
-
-def build_report(title: str, days=None):
-    now = now_utc(); start = None if days is None else now - timedelta(days=days)
-    rows = fetch_rows_since(start); stats = summarize_rows(rows)
-    period_from = "Start" if start is None else start.strftime("%d %b"); period_to = now.strftime("%d %b")
-    report = (
-        f"{title}\n\nPeriod:\n{period_from} → {period_to}\n\nTotal Setups: {stats['total_setups']}\n\n"
-        f"TP Hits: {stats['tp_hits']}\nSL Hits: {stats['sl_hits']}\nBE Hits: {stats['be_hits']}\n\n"
-        f"Win Rate: {stats['win_rate']:.1f}%\n\nPips Won: +{stats['pips_won']:.2f}\n"
-        f"Pips Lost: -{stats['pips_lost']:.2f}\n\nNet Pips: {stats['net_pips']:+.2f}"
-    )
-    return stats, report
-
-def get_latest_signal(pair: str):
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("""SELECT * FROM trade_events WHERE pair = ? AND event_type = 'SETUP'
-                   ORDER BY event_time_utc DESC, id DESC LIMIT 1""", (pair,))
-    setup_row = cur.fetchone()
-    if not setup_row:
-        conn.close(); return None
-    setup_time = setup_row["event_time_utc"]; direction = setup_row["direction"]
-    cur.execute("""SELECT * FROM trade_events WHERE pair = ? AND direction = ? AND event_time_utc >= ?
-                   AND event_type IN ('TP_HIT', 'TP1_HIT', 'SL_HIT', 'BE_HIT', 'MOVE_TO_BE')
-                   ORDER BY event_time_utc DESC, id DESC LIMIT 1""", (pair, direction, setup_time))
-    latest_followup = cur.fetchone(); conn.close()
-    status = "ACTIVE"
-    if latest_followup:
-        latest_type = normalize_event_type(latest_followup["event_type"])
-        if latest_type == "TP_HIT": status = "TP"
-        elif latest_type == "SL_HIT": status = "SL"
-        elif latest_type == "BE_HIT": status = "BE"
-        elif latest_type == "MOVE_TO_BE": status = "MOVE TO BE"
-    return {"pair": pair, "direction": setup_row["direction"], "entry": setup_row["entry"],
-            "stop_price": setup_row["stop_price"], "target_price": setup_row["target_price"],
-            "time": setup_row["event_time_utc"], "status": status}
-
-def build_signal_lookup_message(pair: str) -> str:
-    result = get_latest_signal(pair)
-    if not result: return f"No saved signal found for {pair}."
-    dt = parse_tv_time(result["time"])
-    return (f"Latest {pair} Signal\n\nDirection: {result['direction']}\nEntry: {result['entry']}\n"
-            f"SL: {result['stop_price']}\nTP: {result['target_price']}\n\nStatus: {result['status']}\n"
-            f"Time: {format_timestamp(dt)}")
-
-def get_active_pairs():
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("""SELECT pair, event_type, event_time_utc, id FROM trade_events
-                   WHERE pair IS NOT NULL ORDER BY event_time_utc DESC, id DESC""")
-    rows = cur.fetchall(); conn.close()
-    latest_by_pair = {}
-    for row in rows:
-        pair = row["pair"]
-        if pair and pair not in latest_by_pair:
-            latest_by_pair[pair] = normalize_event_type(row["event_type"])
-    return sorted([pair for pair, event_type in latest_by_pair.items() if event_type in {"SETUP", "MOVE_TO_BE"}])
-
-def build_best_pair_message() -> str:
-    rows = fetch_rows_since(None)
-    if not rows: return "No trade data available yet."
-    by_pair = {}
-    for row in rows:
-        pair = row["pair"]
-        if not pair: continue
-        by_pair.setdefault(pair, {"tp": 0, "sl": 0, "be": 0, "net_pips": 0.0})
-        event_type = normalize_event_type(row["event_type"])
-        if event_type == "TP_HIT":
-            by_pair[pair]["tp"] += 1; by_pair[pair]["net_pips"] += float(row["target_pips"] or 0.0)
-        elif event_type == "SL_HIT":
-            by_pair[pair]["sl"] += 1; by_pair[pair]["net_pips"] -= float(row["stop_pips"] or 0.0)
-        elif event_type == "BE_HIT":
-            by_pair[pair]["be"] += 1
-    ranked = list(by_pair.items())
-    if not ranked: return "No pair performance data available yet."
-    ranked.sort(key=lambda x: x[1]["net_pips"], reverse=True)
-    pair, stats = ranked[0]
-    resolved_for_winrate = stats["tp"] + stats["sl"]
-    win_rate = (stats["tp"] / resolved_for_winrate * 100.0) if resolved_for_winrate > 0 else 0.0
-    return (f"🏆 Best Performing Pair\n\n{pair}\n\nTP: {stats['tp']}\nSL: {stats['sl']}\nBE: {stats['be']}\n\n"
-            f"Win Rate: {win_rate:.1f}%\nNet Pips: {stats['net_pips']:+.2f}")
-
-def build_ranking_message() -> str:
-    rows = fetch_rows_since(None)
-    if not rows: return "No pair ranking data available yet."
-    by_pair = {}
-    for row in rows:
-        pair = row["pair"]
-        if not pair: continue
-        by_pair.setdefault(pair, 0.0)
-        event_type = normalize_event_type(row["event_type"])
-        if event_type == "TP_HIT": by_pair[pair] += float(row["target_pips"] or 0.0)
-        elif event_type == "SL_HIT": by_pair[pair] -= float(row["stop_pips"] or 0.0)
-    ranked = sorted(by_pair.items(), key=lambda x: x[1], reverse=True)
-    if not ranked: return "No pair ranking data available yet."
-    lines = ["📊 Pair Performance\n"]; medals = ["1️⃣", "2️⃣", "3️⃣"]
-    for idx, (pair, pips) in enumerate(ranked[:10]):
-        prefix = medals[idx] if idx < 3 else f"{idx + 1}."
-        lines.append(f"{prefix} {pair}   {pips:+.2f} pips")
-    return "\n".join(lines)
-
-def build_live_performance_message(pair: str):
-    rows = get_pair_rows(pair)
-    if not rows: return None
-    stats = summarize_rows(rows); latest = get_latest_signal(pair); status = latest["status"] if latest else "NO SIGNAL"
-    return (f"Live Performance\nTP: {stats['tp_hits']}\nSL: {stats['sl_hits']}\nBE: {stats['be_hits']}\n"
-            f"Win Rate: {stats['win_rate']:.2f}%\nNet Pips: {stats['net_pips']:+.2f}\nStatus: {status}")
-
-def build_pairstatus_message(pair: str) -> str:
-    latest = get_latest_signal(pair); live = build_live_performance_message(pair)
-    if not latest and not live: return f"No live data found for {pair}."
-    lines = [f"{pair} STATUS\n"]
-    if latest:
-        lines.append(f"Active Trade: {'YES' if latest['status'] in {'ACTIVE', 'MOVE TO BE'} else 'NO'}")
-        lines.append(f"Direction: {latest['direction']}")
-        lines.append(f"Entry: {latest['entry']}")
-        lines.append(f"TP: {latest['target_price']}")
-        lines.append(f"SL: {latest['stop_price']}")
-        lines.append("")
-    if live: lines.append(live)
-    return "\n".join(lines)
-
-def upsert_pair_return(pair, risk_pct, profit_pct, max_drawdown_pct, days, rr, trades):
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("""INSERT INTO pair_returns (
-            pair, risk_pct, profit_pct, max_drawdown_pct, days, rr, trades, updated_at_utc
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(pair) DO UPDATE SET
-            risk_pct = excluded.risk_pct, profit_pct = excluded.profit_pct,
-            max_drawdown_pct = excluded.max_drawdown_pct, days = excluded.days,
-            rr = excluded.rr, trades = excluded.trades, updated_at_utc = excluded.updated_at_utc""",
-        (pair, risk_pct, profit_pct, max_drawdown_pct, days, rr, trades, now_utc().isoformat()))
-    conn.commit(); conn.close()
-
-def delete_pair_return(pair):
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("DELETE FROM pair_returns WHERE pair = ?", (pair,))
-    deleted = cur.rowcount; conn.commit(); conn.close()
-    return deleted > 0
-
-def get_pair_return(pair):
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("SELECT * FROM pair_returns WHERE pair = ?", (pair,))
-    row = cur.fetchone(); conn.close()
-    return row
-
-def get_all_pair_returns():
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("SELECT * FROM pair_returns ORDER BY profit_pct DESC, pair ASC")
-    rows = cur.fetchall(); conn.close()
-    return rows
-
-def build_return_message(pair: str) -> str:
-    row = get_pair_return(pair); live = build_live_performance_message(pair)
-    if not row and not live: return f"No return or live data saved for {pair}."
-    lines = [f"📊 {pair}\n"]
-    if row:
-        lines.extend([
-            "Expected Return", f"Risk: {row['risk_pct']:.2f}%", f"Profit: {row['profit_pct']:.2f}%",
-            f"Max Drawdown: {row['max_drawdown_pct']:.2f}%", f"RR: {row['rr']:.2f}",
-            f"Trades: {row['trades']}", f"Days Tested: {row['days']}", "",
-        ])
-    else:
-        lines.extend(["Expected Return", "No expected return data saved.", ""])
-    lines.append(live or "Live Performance\nNo live trade data saved.")
-    return "\n".join(lines)
-
-def build_expected_returns_message() -> str:
-    rows = get_all_pair_returns()
-    if not rows: return "No expected return data saved yet."
-    lines = ["📊 EXPECTED RETURNS\n"]
-    for row in rows[:20]: lines.append(f"{row['pair']}   {row['profit_pct']:.2f}%")
-    return "\n".join(lines)
-
-def fetch_calendar():
-    url = f"https://api.tradingeconomics.com/calendar?c={TE_API_KEY}"
-    resp = requests.get(url, timeout=20); resp.raise_for_status()
-    return resp.json()
-
-def extract_currency_country(event):
-    currency = str(event.get("Currency", "")).upper().strip()
-    country = str(event.get("Country", "")).strip()
-    if currency: return currency
-    country_map = {"United States": "USD", "Euro Area": "EUR", "United Kingdom": "GBP",
-                   "Australia": "AUD", "New Zealand": "NZD", "Canada": "CAD",
-                   "Switzerland": "CHF", "Japan": "JPY"}
-    return country_map.get(country, "")
-
-def affected_pairs_for_currency(currency):
-    return [p for p in CURRENCY_TO_PAIRS.get(currency, []) if p in TOPIC_MAP]
-
-def get_upcoming_news_events(min_importance=2):
-    now = now_utc(); events = fetch_calendar(); results = []
-    for event in events:
-        importance = int(event.get("Importance", 0) or 0)
-        if importance < min_importance: continue
-        event_dt = parse_calendar_time(event.get("Date"))
-        if event_dt is None: continue
-        currency = extract_currency_country(event)
-        if not currency: continue
-        affected_pairs = affected_pairs_for_currency(currency)
-        if not affected_pairs: continue
-        event_name = str(event.get("Event", "Economic Event")).strip()
-        minutes_until = int((event_dt - now).total_seconds() // 60)
-        results.append({
-            "currency": currency, "event": event_name, "time": event_dt, "minutes_until": minutes_until,
-            "affected_pairs": affected_pairs, "importance": importance,
-            "actual": event.get("Actual"), "forecast": event.get("Forecast"), "previous": event.get("Previous"),
-        })
-    results.sort(key=lambda x: x["time"])
-    return results
-
-def news_already_sent(event_key):
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("SELECT 1 FROM sent_news_events WHERE event_key = ?", (event_key,))
-    row = cur.fetchone(); conn.close()
-    return row is not None
-
-def mark_news_sent(event_key):
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO sent_news_events (event_key, sent_at_utc) VALUES (?, ?)",
-                (event_key, now_utc().isoformat()))
-    conn.commit(); conn.close()
-
-def build_active_trade_news_block(affected_pairs):
-    active_pairs = set(get_active_pairs())
-    affected_active = [p for p in affected_pairs if p in active_pairs]
-    if not affected_active: return ""
-    lines = "\n".join([f"• {p}" for p in affected_active])
-    return f"\n\nAffects Active Trades:\n{lines}"
-
-def build_next_news_message():
-    items = get_upcoming_news_events(min_importance=2)
-    items = [x for x in items if x["minutes_until"] >= 0]
-    if not items: return "No upcoming medium or high impact news found."
-    item = items[0]
-    pair_lines = "\n".join([f"• {p}" for p in item["affected_pairs"]])
-    impact_text = "HIGH" if item["importance"] >= 3 else "MEDIUM"
-    impact_emoji = "🔴" if item["importance"] >= 3 else "🟠"
-    active_block = build_active_trade_news_block(item["affected_pairs"])
-    return (f"{impact_emoji} Next {impact_text} Impact News\n\nEvent: {item['event']}\n"
-            f"Currency: {item['currency']}\nTime: {format_timestamp(item['time'])}\n"
-            f"In: {item['minutes_until']} minutes\n\nAffected Pairs:\n{pair_lines}{active_block}")
-
-def build_todays_news_message():
-    items = get_upcoming_news_events(min_importance=2)
-    today = now_utc().date()
-    today_items = [x for x in items if x["time"].date() == today and x["minutes_until"] >= 0]
-    if not today_items: return "No upcoming medium or high impact news found today."
-    lines = ["Today's News\n"]; active_pairs = set(get_active_pairs())
-    for item in today_items[:10]:
-        impact_emoji = "🔴" if item["importance"] >= 3 else "🟠"
-        pair_text = ", ".join(item["affected_pairs"])
-        active_affected = [p for p in item["affected_pairs"] if p in active_pairs]
-        active_text = f"\nActive Trades: {', '.join(active_affected)}" if active_affected else ""
-        lines.append(f"{impact_emoji} {item['currency']} {item['event']}\n{format_timestamp(item['time'])} "
-                     f"({item['minutes_until']}m)\nPairs: {pair_text}{active_text}\n")
-    return "\n".join(lines)
-
-def infer_event_bias(event_name: str, currency: str, actual, forecast):
-    if actual in (None, "", "None") or forecast in (None, "", "None"): return None
-    actual_num = to_float(actual); forecast_num = to_float(forecast)
-    if actual_num is None or forecast_num is None: return None
-    matched = None; name_upper = event_name.upper()
-    for key, rule in NEWS_RULES.items():
-        if key in name_upper:
-            matched = rule; break
-    if not matched: return None
-    positive = actual_num > forecast_num if matched["better"] == "higher" else actual_num < forecast_num
-    if actual_num == forecast_num: return "Neutral"
-    return f"Bullish {currency}" if positive == matched["currency_positive"] else f"Bearish {currency}"
-
-def post_released_high_impact_news():
-    try:
-        items = get_upcoming_news_events(min_importance=3); now = now_utc(); sent = []
-        for item in items:
-            seconds_since = (now - item["time"]).total_seconds()
-            if not (0 <= seconds_since <= 1800): continue
-            if item["actual"] in (None, "", "None"): continue
-            event_key = f"released|{item['currency']}|{item['event']}|{item['time'].isoformat()}"
-            if news_already_sent(event_key): continue
-            bias = infer_event_bias(item["event"], item["currency"], item["actual"], item["forecast"])
-            bias_block = f"\nBias:\n📊 {bias}\n" if bias else ""
-            message = (f"🚨 HIGH IMPACT NEWS\n\n{item['currency']} {item['event']}\n\nActual: {item['actual']}\n"
-                       f"Forecast: {item['forecast']}\nPrevious: {item['previous']}{bias_block}"
-                       f"\nTime: {format_timestamp(item['time'])}")
-            tg_resp = send_telegram_message(message, thread_id=HIGH_IMPACT_NEWS_TOPIC)
-            if tg_resp.status_code == 200:
-                mark_news_sent(event_key); sent.append(item["event"])
-        return {"ok": True, "sent_count": len(sent), "sent": sent}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-def fetch_mediastack_news(keywords, limit=3):
-    if not MEDIASTACK_API_KEY: return []
-    try:
-        params = {"access_key": MEDIASTACK_API_KEY, "keywords": keywords, "languages": "en",
-                  "sort": "published_desc", "limit": limit}
-        r = requests.get("http://api.mediastack.com/v1/news", params=params, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        return data.get("data", []) or []
-    except Exception:
-        return []
-
-def build_market_news_post(prefix: str, title: str, source: str):
-    return f"🌐 MARKET NEWS\n\n{prefix}\n\n{title}\n\nSource: {source or 'Unknown'}"
-
-def run_auto_market_news():
-    sent = []
-    feeds = [
-        ("gold OR xauusd OR inflation OR fed OR precious metals", "🟡 GOLD UPDATE", "gold"),
-        ("oil OR crude OR wti OR brent OR opec", "🛢 OIL UPDATE", "oil"),
-        ("iran OR israel OR war OR conflict OR sanctions OR missile", "⚡ MACRO UPDATE", "macro"),
-    ]
-    for keywords, prefix, tag in feeds:
-        items = fetch_mediastack_news(keywords, limit=3)
-        for item in items:
-            title = str(item.get("title", "")).strip(); source = str(item.get("source", "")).strip()
-            item_key = f"{tag}|{title}|{source}"
-            if not title or market_item_already_sent(item_key): continue
-            msg = build_market_news_post(prefix, title, source)
-            tg_resp = send_telegram_message(msg, thread_id=MARKET_NEWS_TOPIC)
-            if tg_resp.status_code == 200:
-                mark_market_item_sent(item_key); sent.append(item_key)
-    return {"ok": True, "sent_count": len(sent), "sent": sent}
-
-def send_market_open(session_name):
-    if session_name == "London":
-        text = ("🌐 MARKET NEWS\n\n📊 MARKET OPEN\n\nLondon session is live\n\n"
-                "→ EUR & GBP pairs active\n→ Expect volatility\n\nFocus:\n⚠️ EURUSD, GBPUSD, EURGBP")
-    elif session_name == "New York":
-        text = ("🌐 MARKET NEWS\n\n📊 MARKET OPEN\n\nNew York session is live\n\n"
-                "→ USD is now in focus\n→ Gold and US assets may become more active\n\n"
-                "Focus:\n⚠️ USD pairs and Gold")
-    else:
-        return False
-    return send_telegram_message(text, thread_id=MARKET_NEWS_TOPIC).status_code == 200
-
-def run_market_open_check():
-    now = now_utc(); sent = []
-    london_key = f"London|{now.strftime('%Y-%m-%d')}"; ny_key = f"NewYork|{now.strftime('%Y-%m-%d')}"
-    if now.hour == 7 and not market_open_already_sent(london_key):
-        if send_market_open("London"):
-            mark_market_open_sent(london_key); sent.append("London")
-    if now.hour == 13 and not market_open_already_sent(ny_key):
-        if send_market_open("New York"):
-            mark_market_open_sent(ny_key); sent.append("New York")
-    return {"ok": True, "sent": sent}
-
-def build_signal_message(data):
-    pair = str(data.get("pair", "")).upper().strip()
-    direction = str(data.get("direction", "")).upper().strip()
-    entry = str(data.get("entry", "")).strip()
-    stop_price = str(data.get("stop_price", "")).strip()
-    stop_pips = str(data.get("stop_pips", "")).strip()
-    target_price = str(data.get("target_price", "")).strip()
-    target_pips = str(data.get("target_pips", "")).strip()
-    rr = str(data.get("rr", "")).strip()
-    tf = format_tf(data.get("timeframe", "")); raw_time = str(data.get("time", "")).strip()
-    event_type = normalize_event_type(data.get("event_type", "SETUP"))
-    dt = parse_tv_time(raw_time); session = get_session(dt); time_text = format_timestamp(dt)
-    emoji = "📈" if direction == "BUY" else "📉"; pair_emoji = PAIR_EMOJI.get(pair, "💱")
-    if event_type == "SETUP":
-        return (f"{emoji} {pair_emoji} {pair} {direction} SETUP\n\nEntry: {entry}\n"
-                f"SL: {stop_price} ({stop_pips} pips)\nTP: {target_price} ({target_pips} pips)\n\n"
-                f"RR: {rr}:1\nTF: {tf}\nSession: {session}\nTime: {time_text}")
-    if event_type == "TP_HIT":
-        return (f"✅ {pair_emoji} {pair} TP HIT\n\nDirection: {direction}\nEntry: {entry}\n"
-                f"TP: {target_price} ({target_pips} pips)\nTF: {tf}\nTime: {time_text}")
-    if event_type == "SL_HIT":
-        return (f"❌ {pair_emoji} {pair} SL HIT\n\nDirection: {direction}\nEntry: {entry}\n"
-                f"SL: {stop_price} ({stop_pips} pips)\nTF: {tf}\nTime: {time_text}")
-    if event_type == "MOVE_TO_BE":
-        return (f"🟠 {pair_emoji} {pair} MOVE TO BE\n\nDirection: {direction}\nEntry: {entry}\n"
-                f"SL moved to break even\nTF: {tf}\nTime: {time_text}")
-    if event_type == "BE_HIT":
-        return (f"🔒 {pair_emoji} {pair} BE HIT\n\nDirection: {direction}\nEntry: {entry}\n"
-                f"Trade closed at break even\nTF: {tf}\nTime: {time_text}")
-    return f"ℹ️ {pair_emoji} {pair} {event_type}\n\nDirection: {direction}\nTF: {tf}\nTime: {time_text}"
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    try:
-        data = request.get_json(force=True)
-        if not webhook_secret_valid(data):
-            return jsonify({"ok": False, "error": "Invalid secret"}), 403
-        pair = str(data.get("pair", "")).upper().strip()
-        event_type = normalize_event_type(data.get("event_type", "SETUP"))
-        signal_id = build_signal_id(data)
-        if webhook_already_processed(signal_id):
-            return jsonify({"ok": True, "status": "duplicate_ignored", "signal_id": signal_id}), 200
-        if not pair:
-            return jsonify({"ok": False, "error": "Missing pair"}), 400
-        if event_type == "PAIR_STATS":
-            risk_pct = to_float(data.get("risk_pct")); profit_pct = to_float(data.get("profit_pct"))
-            max_dd_pct = to_float(data.get("max_drawdown_pct")); days = to_int(data.get("days"))
-            rr = to_float(data.get("rr")); trades = to_int(data.get("trades"))
-            if None in (risk_pct, profit_pct, max_dd_pct, days, rr, trades):
-                return jsonify({"ok": False, "error": "Missing PAIR_STATS fields"}), 400
-            upsert_pair_return(pair, risk_pct, profit_pct, max_dd_pct, days, rr, trades)
-            topic = TOPIC_MAP.get(pair); message = build_return_message(pair)
-            tg_resp = send_telegram_message(message, thread_id=topic)
-            if tg_resp.status_code != 200:
-                return jsonify({"ok": False, "error": "Telegram send failed"}), 502
-            mark_webhook_processed(signal_id, event_type)
-            return jsonify({"ok": True, "status": "pair_stats_saved", "signal_id": signal_id}), 200
-        direction = str(data.get("direction", "")).upper().strip()
-        timeframe = format_tf(data.get("timeframe", "")); raw_time = str(data.get("time", "")).strip()
-        dt = parse_tv_time(raw_time)
-        log_trade_event(
-            event_time_utc=dt.astimezone(timezone.utc).isoformat(),
-            pair=pair, direction=direction, event_type=event_type, timeframe=timeframe,
-            entry=to_float(data.get("entry")), stop_price=to_float(data.get("stop_price")),
-            stop_pips=to_float(data.get("stop_pips")), target_price=to_float(data.get("target_price")),
-            target_pips=to_float(data.get("target_pips")), risk="", lot_size="", rr=str(data.get("rr", "")).strip(),
-        )
-        if event_type == "SETUP":
-            store_pending_signal(data, signal_id)
-        elif event_type in {"TP_HIT", "SL_HIT", "BE_HIT", "MOVE_TO_BE"}:
-            resolve_pending_signals_for_pair(pair, direction)
-        topic = TOPIC_MAP.get(pair); message = build_signal_message(data)
-        tg_resp = send_telegram_message(message, thread_id=topic)
-        if tg_resp.status_code != 200:
-            return jsonify({"ok": False, "error": "Telegram send failed"}), 502
-        mark_webhook_processed(signal_id, event_type)
-        return jsonify({"ok": True, "status": "sent", "signal_id": signal_id}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.route("/ea/check-licence", methods=["GET", "POST"])
-@app.route("/ea/check-license", methods=["GET", "POST"])
-def ea_check_licence():
-    try:
-        data = get_request_payload()
-        ok, reason, row = validate_licence(
-            data.get("licence_key") or data.get("license_key"),
-            data.get("mt5_account") or data.get("account"),
-            data.get("broker_server") or data.get("broker")
-        )
-        return jsonify({"ok": True, "valid": ok, "reason": reason,
-                        "active": bool(row["active"]) if row else False,
-                        "expires_at_utc": row["expires_at_utc"] if row else None}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "valid": False, "error": str(e)}), 500
-
-@app.route("/ea/trade-update", methods=["POST"])
-def ea_trade_update():
-    try:
-        data = request.get_json(force=True)
-        allowed, info = ea_access_allowed(data)
-        if not allowed:
-            return jsonify({"ok": False, "error": info.get("reason", "Licence check failed")}), 403
-        update_id = save_ea_trade_update(data)
-        stats = build_ea_stats_summary(data.get("licence_key") or data.get("license_key"), data.get("mt5_account") or data.get("account"))
-        return jsonify({"ok": True, "saved": True, "update_id": update_id, "stats": stats}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/ea/stats", methods=["GET", "POST"])
-def ea_stats():
-    try:
-        data = get_request_payload()
-        allowed, info = ea_access_allowed(data)
-        if not allowed:
-            return jsonify({"ok": False, "error": info.get("reason", "Licence check failed")}), 403
-        stats = build_ea_stats_summary(data.get("licence_key") or data.get("license_key"), data.get("mt5_account") or data.get("account"))
-        return jsonify({"ok": True, **stats}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/admin/licences/create", methods=["POST"])
-@app.route("/admin/licenses/create", methods=["POST"])
-def admin_create_licence():
-    try:
-        if not admin_api_valid(request):
-            return jsonify({"ok": False, "error": "Invalid admin key"}), 403
-        data = request.get_json(force=True)
-        licence_key = str(data.get("licence_key") or data.get("license_key") or "").strip()
-        if not licence_key:
-            return jsonify({"ok": False, "error": "Missing licence_key"}), 400
-        now_iso = now_utc().isoformat()
-        conn = get_db(); cur = conn.cursor()
-        cur.execute("""INSERT INTO licences (
-            licence_key, customer_name, customer_email, mt5_account, broker_server, active, expires_at_utc, notes, created_at_utc, updated_at_utc
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(licence_key) DO UPDATE SET
-            customer_name = excluded.customer_name, customer_email = excluded.customer_email,
-            mt5_account = excluded.mt5_account, broker_server = excluded.broker_server,
-            active = excluded.active, expires_at_utc = excluded.expires_at_utc,
-            notes = excluded.notes, updated_at_utc = excluded.updated_at_utc""", (
-            licence_key, str(data.get("customer_name") or "").strip(), str(data.get("customer_email") or "").strip(),
-            str(data.get("mt5_account") or data.get("account") or "").strip(),
-            str(data.get("broker_server") or data.get("broker") or "").strip(),
-            1 if data.get("active", True) else 0, str(data.get("expires_at_utc") or data.get("expires") or "").strip(),
-            str(data.get("notes") or "").strip(), now_iso, now_iso
-        ))
-        conn.commit(); conn.close()
-        return jsonify({"ok": True, "licence_key": licence_key, "saved": True}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/admin/licences/deactivate", methods=["POST"])
-@app.route("/admin/licenses/deactivate", methods=["POST"])
-def admin_deactivate_licence():
-    try:
-        if not admin_api_valid(request):
-            return jsonify({"ok": False, "error": "Invalid admin key"}), 403
-        data = request.get_json(force=True)
-        licence_key = str(data.get("licence_key") or data.get("license_key") or "").strip()
-        conn = get_db(); cur = conn.cursor()
-        cur.execute("UPDATE licences SET active = 0, updated_at_utc = ? WHERE licence_key = ?", (now_utc().isoformat(), licence_key))
-        conn.commit(); updated = cur.rowcount; conn.close()
-        return jsonify({"ok": True, "deactivated": updated > 0, "licence_key": licence_key}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/admin/licences/list", methods=["GET"])
-@app.route("/admin/licenses/list", methods=["GET"])
-def admin_list_licences():
-    try:
-        if not admin_api_valid(request):
-            return jsonify({"ok": False, "error": "Invalid admin key"}), 403
-        conn = get_db(); cur = conn.cursor()
-        cur.execute("SELECT licence_key, customer_name, customer_email, mt5_account, broker_server, active, expires_at_utc, created_at_utc, last_checked_at_utc FROM licences ORDER BY id DESC")
-        rows = [dict(r) for r in cur.fetchall()]; conn.close()
-        return jsonify({"ok": True, "licences": rows}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/ea/clear-pending", methods=["GET", "POST"])
-def ea_clear_pending():
-    try:
-        payload = get_request_payload()
-        allowed, info = ea_access_allowed(payload)
-        if not allowed:
-            return jsonify({"ok": False, "error": info.get("reason", "Licence check failed")}), 403
-        deleted = clear_all_pending_signals()
-        return jsonify({"ok": True, "deleted_pending": deleted}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/ea/health", methods=["GET"])
-def ea_health():
-    return jsonify({"ok": True, "version": VERSION, "utc": now_utc().isoformat()}), 200
-
-@app.route("/ea/pending-signals", methods=["GET"])
-def ea_pending_signals():
-    try:
-        payload = get_request_payload()
-        allowed, info = ea_access_allowed(payload)
-        if not allowed:
-            return jsonify({"ok": False, "error": info.get("reason", "Licence check failed")}), 403
-        limit = to_int(request.args.get("limit", "50")) or 50
-        rows = get_pending_signals(limit)
-        signals = []
-
-        for row in rows:
-            payload = json.loads(row["payload_json"])
-
-            payload["status"] = row["status"]
-            payload["created_at_utc"] = row["created_at_utc"]
-
-            # CLEAN TIMESTAMP FOR MT5
-            try:
-                dt = datetime.fromisoformat(row["created_at_utc"])
-                payload["created_at_mt5"] = dt.strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                payload["created_at_mt5"] = row["created_at_utc"]
-
-            signals.append(payload)
-
-        return jsonify({"ok": True, "signals": signals}), 200
-
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/ea/ack", methods=["POST"])
-def ea_ack():
-    try:
-        data = request.get_json(force=True)
-        allowed, info = ea_access_allowed(data)
-        if not allowed:
-            return jsonify({"ok": False, "error": info.get("reason", "Licence check failed")}), 403
-        signal_id = str(data.get("signal_id", "")).strip()
-        if not signal_id:
-            return jsonify({"ok": False, "error": "Missing signal_id"}), 400
-        updated = acknowledge_signal(signal_id)
-        return jsonify({"ok": True, "acknowledged": updated, "signal_id": signal_id}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/daily-report", methods=["GET"])
-def daily_report():
-    try:
-        stats, report = build_report("📊 DAILY RESULTS", days=1)
-        return jsonify({"ok": True, **stats, "report": report}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/weekly-report", methods=["GET"])
-def weekly_report():
-    try:
-        stats, report = build_report("📊 WEEKLY RESULTS", days=7)
-        return jsonify({"ok": True, **stats, "report": report}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/weekly-report/send", methods=["GET", "POST"])
-def weekly_report_send():
-    try:
-        if not RESULTS_TOPIC:
-            return jsonify({"ok": False, "error": "RESULTS_TOPIC not set"}), 400
-        stats, report = build_report("📊 WEEKLY RESULTS", days=7)
-        tg_resp = send_telegram_message(report, thread_id=RESULTS_TOPIC)
-        if tg_resp.status_code != 200:
-            return jsonify({"ok": False, "error": "Telegram send failed"}), 502
-        return jsonify({"ok": True, "report_sent": True, **stats}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/check-news", methods=["GET", "POST"])
-def check_news():
-    try:
-        news_items = get_upcoming_news_events(min_importance=3); sent = []
-        for item in news_items:
-            minutes_until = item["minutes_until"]
-            if not (0 <= minutes_until <= 30): continue
-            event_key = f"upcoming|{item['currency']}|{item['event']}|{item['time'].isoformat()}"
-            if news_already_sent(event_key): continue
-            pair_lines = "\n".join([f"• {p}" for p in item["affected_pairs"]])
-            active_block = build_active_trade_news_block(item["affected_pairs"])
-            message = (f"🔴 HIGH IMPACT NEWS SOON\n\nCurrency: {item['currency']}\nEvent: {item['event']}\n"
-                       f"Time: {format_timestamp(item['time'])}\nStarts In: {minutes_until} minutes\n\n"
-                       f"Affected Pairs:\n{pair_lines}{active_block}\n\nBe aware of volatility.")
-            tg_resp = send_telegram_message(message, thread_id=HIGH_IMPACT_NEWS_TOPIC)
-            if tg_resp.status_code == 200:
-                mark_news_sent(event_key); sent.append({"currency": item["currency"], "event": item["event"], "minutes_until": minutes_until})
-        return jsonify({"ok": True, "sent_count": len(sent), "sent": sent}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/released-news-check", methods=["GET"])
-def released_news_check():
-    result = post_released_high_impact_news()
-    return jsonify(result), (200 if result.get("ok") else 500)
-
-@app.route("/market-open-check", methods=["GET"])
-def market_open_check():
-    return jsonify(run_market_open_check()), 200
-
-@app.route("/market-news-auto", methods=["GET"])
-def market_news_auto():
-    return jsonify(run_auto_market_news()), 200
-
-def calculate_lot_size(pair, risk, stop_pips):
-    pip_value = PIP_VALUE_MAP.get(pair)
-    if pip_value is None: return None, None
-    if stop_pips <= 0: return pip_value, None
-    return pip_value, risk / (stop_pips * pip_value)
-
-def process_lotsize_command(text):
-    parts = text.strip().split()
-    if len(parts) != 4:
-        return "Lot Size Calculator\n\nUse:\n/lotsize PAIR RISK STOP_PIPS\n\nExample:\n/lotsize AUDCAD 200 25"
-    _, pair, risk_raw, stop_raw = parts; pair = pair.upper().strip()
-    try:
-        risk = float(risk_raw); stop_pips = float(stop_raw)
-    except ValueError:
-        return "Invalid numbers. Example:\n/lotsize AUDCAD 200 25"
-    pip_value, lot_size = calculate_lot_size(pair, risk, stop_pips)
-    if pip_value is None: return f"No pip value saved for {pair}."
-    if lot_size is None: return "Stop pips must be greater than 0."
-    return (f"Lot Size Result\n\nPair: {pair}\nRisk: £{risk:.2f}\nStop: {stop_pips:.2f} pips\n"
-            f"Pip Value: {pip_value:.4f}\n\nLot Size: {lot_size:.2f}")
-
-def reset_trade_stats():
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("DELETE FROM trade_events"); conn.commit(); conn.close()
-
-def reset_pair_stats(pair):
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("DELETE FROM trade_events WHERE pair = ?", (pair,))
-    deleted = cur.rowcount; conn.commit(); conn.close()
-    return deleted
 
 @app.route("/telegram-webhook", methods=["POST"])
 def telegram_webhook():
     try:
-        data = request.get_json(force=True)
-        message = data.get("message") or data.get("edited_message")
-        if not message: return jsonify({"ok": True, "ignored": True}), 200
+        update = request.get_json(force=True)
+
+        message = update.get("message") or update.get("edited_message")
+        if not message:
+            return jsonify({"ok": True, "ignored": "no_message"}), 200
+
         text = str(message.get("text", "")).strip()
-        chat = message.get("chat", {}); chat_id = str(chat.get("id", ""))
+        chat = message.get("chat", {})
+        chat_id = chat.get("id")
         thread_id = message.get("message_thread_id")
-        from_user = message.get("from", {}); user_id = from_user.get("id")
-        is_bot_user = from_user.get("is_bot", False); message_id = message.get("message_id")
-        if chat_id != CHAT_ID: return jsonify({"ok": True, "ignored": "wrong_chat"}), 200
-        if is_bot_user: return jsonify({"ok": True, "ignored": "bot_message"}), 200
-        admin = is_admin(user_id) if user_id else False
 
-        if (not admin) and (thread_id in PROTECTED_TOPICS):
-            if message_id: delete_telegram_message(message_id)
-            return jsonify({"ok": True, "handled": "deleted_non_admin_message"}), 200
+        if not chat_id:
+            return jsonify({"ok": True, "ignored": "no_chat_id"}), 200
 
-        if text.startswith("/"):
-            if text.startswith("/helpadmin"):
-                if not admin:
-                    send_telegram_message("❌ Admin only command", thread_id=thread_id)
-                else:
-                    help_text = (
-                        "Admin Commands\n\n"
-                        "/helpadmin\n"
-                        "/addreturn PAIR RISK PROFIT MAXDD DAYS RR TRADES\n"
-                        "/deletereturn PAIR\n"
-                        "/resetpair PAIR\n"
-                        "/resetstats"
-                    )
-                    send_telegram_message(help_text, thread_id=thread_id)
+        lower_text = text.lower()
 
-            elif text.startswith("/help"):
-                help_text = (
-                    "Available Commands\n\n"
-                    "/help\n"
-                    "/daily\n"
-                    "/weekly\n"
-                    "/stats\n"
-                    "/nextnews\n"
-                    "/todaynews\n"
-                    "/marketnews\n"
-                    "/signal PAIR\n"
-                    "/bestpair\n"
-                    "/ranking\n"
-                    "/pairstatus PAIR\n"
-                    "/return PAIR\n"
-                    "/expectedreturns\n"
-                    "/lotsize PAIR RISK STOP_PIPS"
-                )
-                send_telegram_message(help_text, thread_id=thread_id)
+        if lower_text.startswith("/start"):
+            reply = build_start_message()
+            tg_response = send_telegram_message(chat_id, reply, thread_id=thread_id)
 
-            elif text.startswith("/daily"):
-                _, report = build_report("📊 DAILY RESULTS", days=1); send_telegram_message(report, thread_id=thread_id)
-            elif text.startswith("/weekly"):
-                _, report = build_report("📊 WEEKLY RESULTS", days=7); send_telegram_message(report, thread_id=thread_id)
-            elif text.startswith("/stats"):
-                _, report = build_report("📊 SIGNAL STATISTICS", days=None); send_telegram_message(report, thread_id=thread_id)
-            elif text.startswith("/nextnews"):
-                send_telegram_message(build_next_news_message(), thread_id=thread_id)
-            elif text.startswith("/todaynews") or text.startswith("/todaysnews"):
-                send_telegram_message(build_todays_news_message(), thread_id=thread_id)
-            elif text.startswith("/marketnews"):
-                gold = fetch_mediastack_news("gold OR xauusd OR inflation OR fed", limit=2)
-                oil = fetch_mediastack_news("oil OR crude OR brent OR opec", limit=2)
-                macro = fetch_mediastack_news("war OR conflict OR geopolitics OR economy", limit=2)
+        elif lower_text.startswith("/help"):
+            reply = build_help_message()
+            tg_response = send_telegram_message(chat_id, reply, thread_id=thread_id)
 
-                def format_items(items, empty_msg):
-                    if not items:
-                        return empty_msg
-                    return "\n".join([f"• {i.get('title','')}" for i in items if i.get("title")])
+        elif lower_text.startswith("/top"):
+            reply = build_top_message()
+            tg_response = send_telegram_message(chat_id, reply, thread_id=thread_id)
 
-                message = (
-                    "🌐 MARKET NEWS\n\n"
-                    "🟡 Gold:\n"
-                    f"{format_items(gold, 'No major news — market relatively quiet')}\n\n"
-                    "🛢 Oil:\n"
-                    f"{format_items(oil, 'No major news — market stable')}\n\n"
-                    "🌍 Macro:\n"
-                    f"{format_items(macro, 'No major geopolitical headlines')}"
-                )
+        elif lower_text.startswith("/risky"):
+            reply = build_risky_message()
+            tg_response = send_telegram_message(chat_id, reply, thread_id=thread_id)
 
-                send_telegram_message(message, thread_id=thread_id)
-            elif text.startswith("/goldupdates"):
-                msg = text.replace("/goldupdates", "", 1).strip()
-                if not msg:
-                    send_telegram_message("Usage:\n/goldupdates [text]\n\nExample:\n/goldupdates Gold rejecting resistance", thread_id=thread_id)
-                else:
-                    send_telegram_message(f"🌐 MARKET NEWS\n\n🟡 GOLD UPDATE\n\n{msg}", thread_id=MARKET_NEWS_TOPIC)
-            elif text.startswith("/oilupdates"):
-                msg = text.replace("/oilupdates", "", 1).strip()
-                if not msg:
-                    send_telegram_message("Usage:\n/oilupdates [text]\n\nExample:\n/oilupdates Oil rising on supply concerns", thread_id=thread_id)
-                else:
-                    send_telegram_message(f"🌐 MARKET NEWS\n\n🛢 OIL UPDATE\n\n{msg}", thread_id=MARKET_NEWS_TOPIC)
-            elif text.startswith("/marketbias"):
-                msg = text.replace("/marketbias", "", 1).strip()
-                if not msg:
-                    send_telegram_message("Usage:\n/marketbias [text]\n\nExample:\n/marketbias USD bullish, gold bearish", thread_id=thread_id)
-                else:
-                    send_telegram_message(f"🌐 MARKET NEWS\n\n📊 MARKET BIAS\n\n{msg}", thread_id=MARKET_NEWS_TOPIC)
-            elif text.startswith("/bestpair"):
-                send_telegram_message(build_best_pair_message(), thread_id=thread_id)
-            elif text.startswith("/ranking"):
-                send_telegram_message(build_ranking_message(), thread_id=thread_id)
-            elif text.startswith("/signal"):
-                parts = text.split()
-                if len(parts) != 2:
-                    send_telegram_message("Usage:\n/signal PAIR\n\nExample:\n/signal EURCHF", thread_id=thread_id)
-                else:
-                    send_telegram_message(build_signal_lookup_message(parts[1].upper().strip()), thread_id=thread_id)
-            elif text.startswith("/pairstatus"):
-                parts = text.split()
-                if len(parts) != 2:
-                    send_telegram_message("Usage:\n/pairstatus PAIR\n\nExample:\n/pairstatus EURCHF", thread_id=thread_id)
-                else:
-                    send_telegram_message(build_pairstatus_message(parts[1].upper().strip()), thread_id=thread_id)
-            elif text.startswith("/expectedreturns"):
-                send_telegram_message(build_expected_returns_message(), thread_id=thread_id)
-            elif text.startswith("/return"):
-                parts = text.split()
-                if len(parts) != 2:
-                    send_telegram_message("Usage:\n/return PAIR\n\nExample:\n/return EURCHF", thread_id=thread_id)
-                else:
-                    send_telegram_message(build_return_message(parts[1].upper().strip()), thread_id=thread_id)
-            elif text.startswith("/lotsize"):
-                if thread_id != LOT_SIZE_TOPIC:
-                    send_telegram_message("Use /lotsize inside the LOT SIZE topic.", thread_id=thread_id)
-                else:
-                    send_telegram_message(process_lotsize_command(text), thread_id=thread_id)
-            elif text.startswith("/addreturn"):
-                if not admin:
-                    send_telegram_message("❌ Admin only command", thread_id=thread_id)
-                else:
-                    parts = text.split()
-                    if len(parts) != 8:
-                        send_telegram_message("Usage:\n/addreturn PAIR RISK PROFIT MAXDD DAYS RR TRADES\n\nExample:\n/addreturn EURCHF 1 69.6 4 158 1.6 141", thread_id=thread_id)
-                    else:
-                        pair = parts[1].upper().strip(); risk_pct = to_float(parts[2]); profit_pct = to_float(parts[3]); max_dd = to_float(parts[4]); days = to_int(parts[5]); rr = to_float(parts[6]); trades = to_int(parts[7])
-                        if None in (risk_pct, profit_pct, max_dd, days, rr, trades):
-                            send_telegram_message("Invalid /addreturn values.", thread_id=thread_id)
-                        else:
-                            existed = get_pair_return(pair) is not None
-                            upsert_pair_return(pair, risk_pct, profit_pct, max_dd, days, rr, trades)
-                            prefix = "♻️ Return updated" if existed else "✅ Return saved"
-                            send_telegram_message(f"{prefix}\n\nPair: {pair}\nRisk: {risk_pct:.2f}%\nProfit: {profit_pct:.2f}%\nMax DD: {max_dd:.2f}%\nRR: {rr:.2f}\nTrades: {trades}\nDays Tested: {days}", thread_id=thread_id)
-            elif text.startswith("/deletereturn"):
-                if not admin:
-                    send_telegram_message("❌ Admin only command", thread_id=thread_id)
-                else:
-                    parts = text.split()
-                    if len(parts) != 2:
-                        send_telegram_message("Usage:\n/deletereturn PAIR\n\nExample:\n/deletereturn EURCHF", thread_id=thread_id)
-                    else:
-                        pair = parts[1].upper().strip()
-                        send_telegram_message(f"{'🗑 Return removed for ' + pair if delete_pair_return(pair) else 'No return data found for ' + pair + '.'}", thread_id=thread_id)
-            elif text.startswith("/resetpair"):
-                if not admin:
-                    send_telegram_message("❌ Admin only command", thread_id=thread_id)
-                else:
-                    parts = text.split()
-                    if len(parts) == 2:
-                        pair = parts[1].upper().strip()
-                        send_telegram_message(f"⚠️ Confirm reset for {pair}\n\nThis will delete:\n• live TP/SL/BE results\n• net pips\n• active trade status\n\nExpected return data will NOT be deleted.\n\nConfirm with:\n/resetpair {pair} confirm", thread_id=thread_id)
-                    elif len(parts) == 3 and parts[2].lower() == "confirm":
-                        pair = parts[1].upper().strip(); deleted = reset_pair_stats(pair)
-                        send_telegram_message(f"✅ Live stats reset for {pair}\nDeleted events: {deleted}", thread_id=thread_id)
-                    else:
-                        send_telegram_message("Usage:\n/resetpair PAIR\n\nThen confirm with:\n/resetpair PAIR confirm", thread_id=thread_id)
-            elif text == "/resetstats":
-                if not admin:
-                    send_telegram_message("❌ Admin only command", thread_id=thread_id)
-                else:
-                    send_telegram_message("⚠️ Confirm full stats reset\n\nThis will delete ALL live trade history.\n\nConfirm with:\n/resetstats confirm RESET", thread_id=thread_id)
-            elif text == "/resetstats confirm RESET":
-                if not admin:
-                    send_telegram_message("❌ Admin only command", thread_id=thread_id)
-                else:
-                    reset_trade_stats(); send_telegram_message("✅ All live stats reset", thread_id=thread_id)
-            return jsonify({"ok": True, "handled": "command"}), 200
-        return jsonify({"ok": True, "ignored": "no_action"}), 200
+        elif lower_text.startswith("/chatid"):
+            reply = build_chatid_message(chat_id, thread_id)
+            tg_response = send_telegram_message(chat_id, reply, thread_id=thread_id)
+
+        elif lower_text.startswith("/sports"):
+            reply = build_sports_message()
+            tg_response = send_telegram_message(chat_id, reply, thread_id=thread_id)
+
+        elif lower_text.startswith("/scanfootball") or lower_text.startswith("/scan"):
+            result = run_football_scan(post_to_topic=True)
+            tg_response = send_telegram_message(chat_id, result["summary"], thread_id=thread_id)
+
+        else:
+            return jsonify({"ok": True, "ignored": "not_a_command"}), 200
+
+        return jsonify({
+            "ok": tg_response.status_code == 200,
+            "telegram_status": tg_response.status_code,
+            "telegram_response": tg_response.json(),
+        }), 200
+
     except Exception as e:
+        try:
+            update = request.get_json(silent=True) or {}
+            message = update.get("message") or update.get("edited_message") or {}
+            chat = message.get("chat", {})
+            error_chat_id = chat.get("id")
+            error_thread_id = message.get("message_thread_id")
+
+            if error_chat_id:
+                send_telegram_message(
+                    error_chat_id,
+                    f"⚠️ <b>Black Book Error</b>\n\n<code>{str(e)}</code>",
+                    thread_id=error_thread_id,
+                )
+        except Exception:
+            pass
+
         return jsonify({"ok": False, "error": str(e)}), 500
 
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
